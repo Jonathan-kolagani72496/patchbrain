@@ -203,7 +203,7 @@ async def list_files(u=Depends(get_user)):
             return [dict(r) for r in rows]
     sb  = _sb()
     res = sb.table("files").select("*,file_versions(id,status,original_filename,size_bytes,created_at,error_message)")\
-          .eq("company_id",str(cid)).is_("deleted_at","null").order("created_at",desc=True).execute()
+          .eq("company_id",str(cid)).is_("deleted_at","null").order("created_at",desc=False).execute()
     return res.data
 
 class FileIdsBody(BaseModel):
@@ -333,7 +333,7 @@ async def get_download_urls(body: FileIdsBody, u=Depends(get_user)):
             .select("id,file_id,storage_bucket,storage_path,original_filename,created_at")\
             .eq("company_id", company_id)\
             .in_("file_id", missing_file_ids)\
-            .order("created_at", desc=True).execute().data or []
+            .order("created_at", desc=False).execute().data or []
         seen: set = set()
         for v in fallback:
             if v["file_id"] not in seen:
@@ -412,7 +412,7 @@ async def get_msgs(sid: str, u=Depends(get_user)):
     sb  = _sb()
     s   = sb.table("conversation_sessions").select("*").eq("id",sid).eq("user_id",str(uid)).single().execute()
     if not s.data: raise HTTPException(404,"Session not found")
-    m   = sb.table("conversation_messages").select("*").eq("session_id",sid).order("created_at",asc=True).execute()
+    m   = sb.table("conversation_messages").select("*").eq("session_id",sid).order("created_at",desc=False).execute()
     return {"session":s.data,"messages":m.data}
 
 @app.delete("/conversations/{sid}")
@@ -540,18 +540,37 @@ async def ask(b: AskBody, u=Depends(get_user)):
             sb.table("conversation_messages")
             .select("role,content")
             .eq("session_id", sids)
-            .order("created_at", desc=True)
+            .order("created_at", desc=False)
             .limit(10)
             .execute()
             .data
             or []
         ))
 
+    # Embed
+    try:
+        emb = await ai.embeddings.create(model="text-embedding-3-small", input=q)
+    except Exception as e:
+        err = str(e).lower()
+        if any(w in err for w in ["quota", "billing", "insufficient", "credit"]):
+            raise HTTPException(402, "OpenAI billing issue — add credits at platform.openai.com")
+        raise HTTPException(500, f"Embedding error: {e}")
+
     # Search
     sb     = _sb()
-    chunks = (sb.rpc("hybrid_search",{
-        "p_company_id":str(cid),"p_query_embedding":emb.data[0].embedding,
-        "p_query_text":q,"p_match_count":10}).execute().data or [])
+    query_embedding = emb.data[0].embedding
+
+    chunks = (
+        sb.rpc("hybrid_search", {
+            "p_company_id": str(cid),
+            "p_query_embedding": query_embedding,
+            "p_query_text": q,
+            "p_match_count": 10,
+        })
+        .execute()
+        .data
+        or []
+    )
 
     # Filenames
     fname_map: dict = {}
@@ -641,11 +660,12 @@ async def _save(sid, cid, uid, q, answer, citations, count, history, srow, token
                     "INSERT INTO conversation_messages(id,session_id,company_id,user_id,role,content,citations_json,tokens_used)"
                     " VALUES($1,$2,$3,$4,'assistant',$5,$6,$7)",
                     uuid.uuid4(),sid,cid,uid,answer,json.dumps(citations),tokens_used)
-                upd = "UPDATE conversation_sessions SET message_count=$1,updated_at=now()"
+                upd  = "UPDATE conversation_sessions SET message_count=$1,updated_at=now()"
                 args = [count, sid]
-                if srow.get("title") in (None,"New conversation"):
-                    upd += ",title=$3"; args.append(q[:60])
-                await c.execute(upd+" WHERE id=$2" if len(args)==2 else upd+" WHERE id=$2", *args)
+                if srow.get("title") in (None, "New conversation"):
+                    upd += ",title=$3"
+                    args.append(q[:60])
+                await c.execute(upd + " WHERE id=$2", *args)
         else:
             sb = _sb()
             sb.table("conversation_messages").insert([
@@ -669,7 +689,7 @@ async def list_conflicts(u=Depends(get_user)):
     rows = sb.table("detected_conflicts") \
         .select("*") \
         .eq("company_id", cid) \
-        .order("created_at", desc=True) \
+        .order("created_at", desc=False) \
         .limit(100) \
         .execute().data or []
     return rows
