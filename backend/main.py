@@ -496,28 +496,56 @@ async def ask(b: AskBody, u=Depends(get_user)):
                 "SELECT role,content FROM conversation_messages "
                 "WHERE session_id=$1 ORDER BY created_at DESC LIMIT 10", sid)]))
     else:
-        sb   = _sb()
-        sr   = sb.table("conversation_sessions").select("*").eq("id",sids).eq("user_id",str(uid)).single().execute()
-        if not sr.data:
-            sb.table("conversation_sessions").insert({"id":sids,"company_id":str(cid),
-                "user_id":str(uid),"title":q[:60],"message_count":0}).execute()
-            srow = {"id":sids,"summary":None,"message_count":0,"title":q[:60]}
+        sb = _sb()
+
+        session_rows = (
+            sb.table("conversation_sessions")
+            .select("*")
+            .eq("id", sids)
+            .eq("user_id", str(uid))
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+
+        if not session_rows:
+            created = (
+                sb.table("conversation_sessions")
+                .insert({
+                    "id": sids,
+                    "company_id": str(cid),
+                    "user_id": str(uid),
+                    "title": q[:60],
+                    "message_count": 0,
+                })
+                .execute()
+                .data
+                or []
+            )
+
+            if created:
+                srow = created[0]
+            else:
+                srow = {
+                    "id": sids,
+                    "summary": None,
+                    "message_count": 0,
+                    "title": q[:60],
+                }
         else:
-            srow = sr.data
-        recent = list(reversed((sb.table("conversation_messages").select("role,content")
-                   .eq("session_id",sids).order("created_at",desc=True).limit(10).execute().data or [])))
+            srow = session_rows[0]
 
-    history    = _build_context(srow, recent)
-    new_count  = (srow.get("message_count") or 0) + 2
-
-    # Embed
-    try:
-        emb = await ai.embeddings.create(model="text-embedding-3-small", input=q)
-    except Exception as e:
-        err = str(e).lower()
-        if any(w in err for w in ["quota","billing","insufficient"]):
-            raise HTTPException(402, "OpenAI billing issue — add credits at platform.openai.com")
-        raise HTTPException(500, f"Embedding error: {e}")
+        recent = list(reversed(
+            sb.table("conversation_messages")
+            .select("role,content")
+            .eq("session_id", sids)
+            .order("created_at", desc=True)
+            .limit(10)
+            .execute()
+            .data
+            or []
+        ))
 
     # Search
     sb     = _sb()
