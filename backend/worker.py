@@ -4,8 +4,9 @@ Run with: python worker.py
 
 This script runs forever, claiming and processing ingestion jobs.
 It downloads each file from Supabase Storage, parses it, chunks it,
-embeds it, writes chunks back to the database, then runs lightweight
-cross-document conflict detection for the company.
+embeds it, and writes chunks back to the database.
+
+Conflict detection is intentionally disabled in this worker version.
 """
 
 import os
@@ -28,20 +29,12 @@ from parsers.excel_parser import parse_excel
 from parsers.docx_parser import parse_docx
 from parsers.whatsapp_parser import parse_whatsapp
 
-# Intelligence
-try:
-    from intelligence.conflict_detector import run_conflict_detection
-except Exception as import_error:
-    run_conflict_detection = None
-    print(f"⚠ Conflict detector not loaded: {import_error}")
-
 load_dotenv()
 
 WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 POLL_INTERVAL = int(os.environ.get("WORKER_POLL_INTERVAL", 5))
 MAX_RETRIES = int(os.environ.get("WORKER_MAX_RETRIES", 3))
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", 100))
-CONFLICT_SCAN_LIMIT = int(os.environ.get("CONFLICT_SCAN_LIMIT", 750))
 
 WHATSAPP_LINE_RE = re.compile(
     r"^(?:"
@@ -71,19 +64,24 @@ def claim_next_job(sb: Client) -> dict | None:
 
 def update_file_status(sb: Client, version_id: str, status: str, error: str | None = None):
     update: dict[str, Any] = {"status": status}
+
     if error:
         update["error_message"] = error[:1000]
+
     if status in ("parsing", "embedding"):
         update["started_at"] = "now()"
+
     if status in ("ready", "failed"):
         update["finished_at"] = "now()"
         update["worker_id"] = WORKER_ID
+
     sb.table("file_versions").update(update).eq("id", version_id).execute()
 
 
 def embed_chunks(texts: list[str]) -> list[list[float]]:
-    """Embeds texts in batches. Returns embedding vectors in same order."""
+    """Embeds texts in batches. Returns embedding vectors in the same order."""
     all_embeddings: list[list[float]] = []
+
     for i in range(0, len(texts), EMBED_BATCH_SIZE):
         batch = texts[i : i + EMBED_BATCH_SIZE]
         response = openai_client.embeddings.create(
@@ -91,6 +89,7 @@ def embed_chunks(texts: list[str]) -> list[list[float]]:
             input=batch,
         )
         all_embeddings.extend([item.embedding for item in response.data])
+
     return all_embeddings
 
 
@@ -99,18 +98,21 @@ def looks_like_whatsapp_export(text: str) -> bool:
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if not lines:
         return False
+
     sample = lines[:80]
     hits = sum(1 for ln in sample if WHATSAPP_LINE_RE.match(ln) and ":" in ln)
     return hits >= 2 or (hits == 1 and len(sample) < 10)
 
 
 def parse_plain_text(text: str, chunk_size: int = 800, overlap: int = 100) -> list[dict]:
-    chunks = []
+    chunks: list[dict] = []
     step = max(1, chunk_size - overlap)
+
     for i in range(0, len(text), step):
         piece = text[i : i + chunk_size].strip()
         if not piece:
             continue
+
         chunks.append({
             "content": piece,
             "source_type": "txt_chunk",
@@ -121,11 +123,13 @@ def parse_plain_text(text: str, chunk_size: int = 800, overlap: int = 100) -> li
             "bbox_json": None,
             "metadata_jsonb": {"char_start": i, "char_end": i + len(piece)},
         })
+
     return chunks
 
 
 def parse_file(local_path: str, original_filename: str, mime_type: str) -> list[dict]:
     ext = Path(original_filename).suffix.lower()
+    mime_type = mime_type or ""
 
     if ext == ".pdf" or mime_type == "application/pdf":
         return parse_pdf(local_path)
@@ -150,82 +154,6 @@ def parse_file(local_path: str, original_filename: str, mime_type: str) -> list[
         return parse_plain_text(text)
 
     raise ValueError(f"Unsupported file type: {ext} ({mime_type})")
-
-
-def fetch_company_chunks_for_conflicts(sb: Client, company_id: str) -> list[dict]:
-    """Fetch recent chunks and attach filenames for conflict detection."""
-    chunks = sb.table("file_chunks")\
-        .select("id,content,source_type,file_version_id,metadata_jsonb,created_at")\
-        .eq("company_id", company_id)\
-        .order("created_at", desc=True)\
-        .limit(CONFLICT_SCAN_LIMIT)\
-        .execute().data or []
-
-    if not chunks:
-        return []
-
-    fv_ids = list({c.get("file_version_id") for c in chunks if c.get("file_version_id")})
-    filename_map: dict[str, str] = {}
-    if fv_ids:
-        versions = sb.table("file_versions")\
-            .select("id,original_filename")\
-            .in_("id", fv_ids)\
-            .execute().data or []
-        filename_map = {v["id"]: v.get("original_filename", "unknown") for v in versions}
-
-    for c in chunks:
-        c["filename"] = filename_map.get(c.get("file_version_id"), "unknown")
-
-    return chunks
-
-
-def normalize_conflict_for_insert(conflict: dict, company_id: str) -> dict:
-    files = conflict.get("files")
-    if not files:
-        files = list(set((conflict.get("files_a") or []) + (conflict.get("files_b") or [])))
-
-    return {
-        "company_id": company_id,
-        "conflict_type": conflict.get("type", "unknown"),
-        "severity": conflict.get("severity", "medium"),
-        "description": conflict.get("description", ""),
-        "detail": conflict.get("detail", ""),
-        "files": files or [],
-        "chunk_ids": conflict.get("chunk_ids") or [],
-        "metadata_jsonb": conflict,
-        "status": "open",
-    }
-
-
-def run_and_store_conflicts(sb: Client, company_id: str):
-    """
-    Recomputes lightweight company-level conflicts.
-    Non-critical by design: if this fails, ingestion should still succeed.
-    """
-    if run_conflict_detection is None:
-        return
-
-    try:
-        chunks = fetch_company_chunks_for_conflicts(sb, company_id)
-        conflicts = run_conflict_detection(chunks)
-
-        # Avoid duplicate rows every time a file is ingested.
-        # For v1, recompute the open conflict snapshot for the company.
-        sb.table("detected_conflicts").delete().eq("company_id", company_id).execute()
-
-        if not conflicts:
-            print("  Conflict detector: 0 conflicts")
-            return
-
-        rows = [normalize_conflict_for_insert(c, company_id) for c in conflicts]
-        for i in range(0, len(rows), 50):
-            sb.table("detected_conflicts").insert(rows[i : i + 50]).execute()
-
-        print(f"  Conflict detector: stored {len(rows)} conflicts")
-
-    except Exception as e:
-        # Do not fail file ingestion because the intelligence layer failed.
-        print(f"  ⚠ Conflict detection skipped/failed: {e}")
 
 
 def process_job(sb: Client, job: dict):
@@ -274,6 +202,7 @@ def process_job(sb: Client, job: dict):
 
     print("  Writing chunks to database")
     rows = []
+
     for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
         rows.append({
             "company_id": company_id,
@@ -295,15 +224,10 @@ def process_job(sb: Client, job: dict):
     for i in range(0, len(rows), 50):
         sb.table("file_chunks").insert(rows[i : i + 50]).execute()
 
-    # Current file version should be set before conflict detection reads across chunks.
     sb.table("files")\
         .update({"current_file_version_id": version_id})\
         .eq("id", file_id)\
         .execute()
-
-    # Run non-blocking-ish intelligence step before marking job done.
-    # It catches its own errors, so ingestion still completes.
-    run_and_store_conflicts(sb, str(company_id))
 
     update_file_status(sb, version_id, "ready")
 
