@@ -573,7 +573,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
         yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
         try:
             async with ant.messages.stream(
-                model="claude-sonnet-4-20250514",
+                model=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
                 max_tokens=1024,
                 system=[{"type":"text","text":SYSTEM_PROMPT,
                          "cache_control":{"type":"ephemeral"}}],
@@ -634,3 +634,14 @@ async def _save(sid, cid, uid, q, answer, citations, count, history, srow, token
 @app.get("/health")
 async def health():
     return {"status":"ok","version":"3.0.0","pool": DB_POOL is not None}
+@app.get("/conflicts")
+async def list_conflicts(u=Depends(get_user)):
+    cid = str(u["company_id"])
+    sb = _sb()
+    rows = sb.table("detected_conflicts") \
+        .select("*") \
+        .eq("company_id", cid) \
+        .order("created_at", desc=True) \
+        .limit(100) \
+        .execute().data or []
+    return rows
