@@ -28,7 +28,11 @@ app = FastAPI(title="PatchBrain API", version="2.0.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=[
+        "http://localhost:3000",
+        "https://patchbrain-dv999vhsf-jonathan-kolagani-s-projects.vercel.app",
+        "https://patchbrain.vercel.app",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
