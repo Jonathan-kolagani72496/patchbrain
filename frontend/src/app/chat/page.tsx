@@ -22,6 +22,7 @@ type Message = {
   content: string
   citations?: Citation[]
   loading?: boolean
+  streaming?: boolean
   created_at?: string
 }
 
@@ -115,9 +116,8 @@ export default function ChatPage() {
     setError('')
     setSelectedCitation(null)
 
-    const userMsg: Message   = { id: Date.now().toString(), role: 'user', content: question }
-    const loadingMsg: Message = { id: Date.now().toString() + '-a', role: 'assistant', content: '', loading: true }
-    setMessages(prev => [...prev, userMsg, loadingMsg])
+    const userMsg: Message = { id: Date.now().toString(), role: 'user', content: question }
+    setMessages(prev => [...prev, userMsg])
 
     try {
       const headers = await getAuthHeader()
@@ -126,25 +126,105 @@ export default function ChatPage() {
         headers: { ...headers, 'Content-Type': 'application/json' },
         body: JSON.stringify({ question, session_id: activeSession }),
       })
+
       if (res.status === 401) { router.push('/login'); return }
-      const data = await res.json()
+
+      // Handle non-streaming error responses (4xx before stream starts)
       if (!res.ok) {
-        const msg = data.detail || 'Something went wrong'
-        setMessages(prev => prev.map(m => m.id === loadingMsg.id ? { ...m, content: msg, loading: false } : m))
+        let msg = 'Something went wrong'
+        try { const d = await res.json(); msg = d.detail || msg } catch {}
+        setMessages(prev => [...prev, { id: Date.now().toString() + '-a', role: 'assistant', content: msg }])
         if (res.status === 402) setError(msg)
         return
       }
-      if (data.session_id && !activeSession) {
-        setActiveSession(data.session_id)
+
+      if (!res.body) throw new Error('No response body')
+
+      const reader  = res.body.getReader()
+      const decoder = new TextDecoder()
+      const aId     = Date.now().toString() + '-a'
+      let assistantText  = ''
+      let finalCitations: Citation[] = []
+      let buffer = ''
+
+      while (true) {
+        const { value, done } = await reader.read()
+        if (done) break
+
+        buffer += decoder.decode(value, { stream: true })
+        const events = buffer.split('\n\n')
+        // Keep incomplete last chunk in buffer
+        buffer = events.pop() ?? ''
+
+        for (const event of events) {
+          if (!event.startsWith('data: ')) continue
+          const jsonText = event.replace(/^data:\s*/, '')
+          try {
+            const parsed = JSON.parse(jsonText)
+
+            if (parsed.type === 'session') {
+              setActiveSession(parsed.session_id)
+            }
+
+            if (parsed.type === 'token') {
+              assistantText += parsed.text
+              setMessages(prev => {
+                const copy = [...prev]
+                const last = copy[copy.length - 1]
+                if (last?.id === aId) {
+                  copy[copy.length - 1] = { ...last, content: assistantText, streaming: true }
+                } else {
+                  copy.push({ id: aId, role: 'assistant', content: assistantText, streaming: true })
+                }
+                return copy
+              })
+            }
+
+            if (parsed.type === 'done') {
+              finalCitations = parsed.citations || []
+              setMessages(prev => {
+                const copy = [...prev]
+                const last = copy[copy.length - 1]
+                if (last?.id === aId) {
+                  copy[copy.length - 1] = { ...last, content: assistantText, citations: finalCitations, streaming: false }
+                }
+                return copy
+              })
+              await loadSessions()
+            }
+
+            if (parsed.type === 'error') {
+              const errMsg = parsed.message || 'An error occurred'
+              setMessages(prev => {
+                const copy = [...prev]
+                const last = copy[copy.length - 1]
+                if (last?.id === aId) {
+                  copy[copy.length - 1] = { ...last, content: errMsg, streaming: false }
+                } else {
+                  copy.push({ id: aId, role: 'assistant', content: errMsg })
+                }
+                return copy
+              })
+              if (errMsg.toLowerCase().includes('billing')) setError(errMsg)
+            }
+
+          } catch (err) {
+            console.error('Bad SSE event:', jsonText, err)
+          }
+        }
       }
-      setMessages(prev => prev.map(m =>
-        m.id === loadingMsg.id ? { ...m, content: data.answer, citations: data.citations, loading: false } : m
-      ))
-      await loadSessions()
+
     } catch {
-      setMessages(prev => prev.map(m =>
-        m.id === loadingMsg.id ? { ...m, content: 'Connection error — is the backend running?', loading: false } : m
-      ))
+      setMessages(prev => {
+        const copy = [...prev]
+        const last = copy[copy.length - 1]
+        if (last?.role === 'assistant') {
+          copy[copy.length - 1] = { ...last, content: 'Connection error — is the backend running?', streaming: false }
+        } else {
+          copy.push({ id: Date.now().toString() + '-a', role: 'assistant', content: 'Connection error — is the backend running?' })
+        }
+        return copy
+      })
     } finally {
       setSending(false)
       inputRef.current?.focus()
@@ -286,6 +366,9 @@ export default function ChatPage() {
                         {msg.role === 'assistant' && msg.citations?.length
                           ? renderAnswer(msg.content, msg.citations)
                           : msg.content}
+                        {msg.streaming && (
+                          <span className="inline-block w-0.5 h-4 bg-orange-400 animate-pulse ml-0.5 align-text-bottom" />
+                        )}
                       </div>
                       {msg.citations && msg.citations.length > 0 && (
                         <div className="mt-2.5 flex flex-wrap gap-1.5">
