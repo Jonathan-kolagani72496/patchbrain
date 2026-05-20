@@ -546,7 +546,8 @@ async def ask(b: AskBody, u=Depends(get_user)):
             .data
             or []
         ))
-
+    history = _build_context(srow, recent)
+    new_count = (srow.get("message_count") or 0) + 2
     # Embed
     try:
         emb = await ai.embeddings.create(model="text-embedding-3-small", input=q)
