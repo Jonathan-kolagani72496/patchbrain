@@ -1,31 +1,31 @@
 """
-PatchBrain FastAPI backend - v2
-- Persistent conversation sessions (multiple chats per user like ChatGPT)
-- Rolling summary memory (token-efficient, never loses context)
-- Anthropic prompt caching (90% discount on system prompt)
-- Filename in every source block
-- Chunk preview in citations
-- Proper billing error messages
-- /me endpoint for company name
+PatchBrain FastAPI backend - v3
+Performance: async/await everywhere, asyncpg connection pool,
+streaming Claude responses, smart context window, parallel DB calls.
 """
 
 import os
 import uuid
+import json
+import asyncio
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, AsyncGenerator
 
+import asyncpg
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from dotenv import load_dotenv
 from supabase import create_client, Client
-from openai import OpenAI
+from openai import AsyncOpenAI
 import anthropic
 
 load_dotenv()
 
-app = FastAPI(title="PatchBrain API", version="2.0.0")
+app = FastAPI(title="PatchBrain API", version="3.0.0")
 
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -38,122 +38,179 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def get_supabase() -> Client:
-    return create_client(
-        os.environ["SUPABASE_URL"],
-        os.environ["SUPABASE_SERVICE_KEY"],
-    )
 
-openai_client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
-claude_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+# ── Connection pool ────────────────────────────────────────────────────────────
+# CRITICAL: use port 6543 (transaction pooler), NOT 5432 (session mode)
+# 5432 caps at ~20 connections. 6543 handles hundreds.
+
+DB_POOL: asyncpg.Pool | None = None
+
+def _db_url() -> str:
+    url     = os.environ["SUPABASE_URL"]
+    ref     = url.replace("https://", "").split(".")[0]
+    pw      = os.environ.get("SUPABASE_DB_PASSWORD", "")
+    return f"postgresql://postgres.{ref}:{pw}@aws-0-us-east-1.pooler.supabase.com:6543/postgres"
+
+@app.on_event("startup")
+async def startup():
+    global DB_POOL
+    try:
+        DB_POOL = await asyncpg.create_pool(
+            _db_url(),
+            min_size=2,
+            max_size=10,
+            command_timeout=30,
+            statement_cache_size=0,   # required for Supabase transaction pooler
+        )
+        print("✓ DB pool ready (port 6543 transaction mode)")
+    except Exception as e:
+        print(f"⚠ DB pool failed — will use Supabase client fallback: {e}")
+
+@app.on_event("shutdown")
+async def shutdown():
+    if DB_POOL:
+        await DB_POOL.close()
+
+def _sb() -> Client:
+    """Sync Supabase client — for auth + storage only."""
+    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+
+ai   = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
+ant  = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
-def get_current_user(authorization: str = Header(...)):
+async def get_user(authorization: str = Header(...)):
     if not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Missing Bearer token")
+        raise HTTPException(401, "Missing Bearer token")
     token = authorization.split(" ", 1)[1]
-    sb = get_supabase()
+    sb    = _sb()
     try:
-        result = sb.auth.get_user(token)
-        if not result or not result.user:
-            raise HTTPException(status_code=401, detail="Invalid token")
-        user_id = result.user.id
+        r = sb.auth.get_user(token)
+        if not r or not r.user:
+            raise HTTPException(401, "Invalid token")
+        uid = r.user.id
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(status_code=401, detail=f"Auth error: {str(e)}")
-    row = sb.table("users").select("*, companies(name, slug)").eq("id", user_id).single().execute()
-    if not row.data:
-        raise HTTPException(status_code=403, detail=f"User not in users table: {user_id}")
-    return row.data
+        raise HTTPException(401, f"Auth error: {e}")
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            row = await c.fetchrow(
+                "SELECT u.*, co.name AS company_name, co.slug AS company_slug "
+                "FROM users u JOIN companies co ON co.id=u.company_id WHERE u.id=$1",
+                uuid.UUID(uid))
+            if not row:
+                raise HTTPException(403, f"User not in users table: {uid}")
+            return dict(row)
+    else:
+        row = sb.table("users").select("*, companies(name,slug)").eq("id", uid).single().execute()
+        if not row.data:
+            raise HTTPException(403, f"User not in users table: {uid}")
+        return row.data
 
 # ── /me ────────────────────────────────────────────────────────────────────────
 
 @app.get("/me")
-def get_me(user=Depends(get_current_user)):
-    company = user.get("companies") or {}
+async def me(u=Depends(get_user)):
     return {
-        "user_id":      user["id"],
-        "email":        user["email"],
-        "role":         user["role"],
-        "company_id":   user["company_id"],
-        "company_name": company.get("name", "Your Company"),
-        "company_slug": company.get("slug", ""),
+        "user_id":      str(u["id"]),
+        "email":        u["email"],
+        "role":         u["role"],
+        "company_id":   str(u["company_id"]),
+        "company_name": u.get("company_name") or "Your Company",
+        "company_slug": u.get("company_slug") or "",
     }
 
 # ── Upload ─────────────────────────────────────────────────────────────────────
 
-class UploadRequestBody(BaseModel):
-    filename:   str
-    mime_type:  str
-    size_bytes: int
+class UploadReq(BaseModel):
+    filename: str; mime_type: str; size_bytes: int
 
 @app.post("/upload/request")
-def request_upload(body: UploadRequestBody, user=Depends(get_current_user)):
-    sb             = get_supabase()
-    company_id     = user["company_id"]
-    file_id        = str(uuid.uuid4())
-    file_version_id = str(uuid.uuid4())
-    storage_path   = f"companies/{company_id}/files/{file_id}/{file_version_id}/{body.filename}"
+async def upload_request(b: UploadReq, u=Depends(get_user)):
+    sb   = _sb()
+    cid  = str(u["company_id"])
+    fid  = str(uuid.uuid4())
+    vid  = str(uuid.uuid4())
+    path = f"companies/{cid}/files/{fid}/{vid}/{b.filename}"
 
-    sb.table("files").insert({
-        "id": file_id, "company_id": company_id, "logical_name": body.filename,
-    }).execute()
-    sb.table("file_versions").insert({
-        "id": file_version_id, "file_id": file_id, "company_id": company_id,
-        "storage_path": storage_path, "original_filename": body.filename,
-        "mime_type": body.mime_type, "size_bytes": body.size_bytes,
-        "status": "uploaded", "created_by": user["id"],
-    }).execute()
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            await c.execute("INSERT INTO files(id,company_id,logical_name) VALUES($1,$2,$3)",
+                            uuid.UUID(fid), uuid.UUID(cid), b.filename)
+            await c.execute(
+                "INSERT INTO file_versions(id,file_id,company_id,storage_path,"
+                "original_filename,mime_type,size_bytes,status,created_by) "
+                "VALUES($1,$2,$3,$4,$5,$6,$7,'uploaded',$8)",
+                uuid.UUID(vid), uuid.UUID(fid), uuid.UUID(cid), path,
+                b.filename, b.mime_type, b.size_bytes, uuid.UUID(str(u["id"])))
+    else:
+        sb.table("files").insert({"id":fid,"company_id":cid,"logical_name":b.filename}).execute()
+        sb.table("file_versions").insert({"id":vid,"file_id":fid,"company_id":cid,
+            "storage_path":path,"original_filename":b.filename,"mime_type":b.mime_type,
+            "size_bytes":b.size_bytes,"status":"uploaded","created_by":str(u["id"])}).execute()
 
-    signed = sb.storage.from_("company-files").create_signed_upload_url(storage_path)
-    return {
-        "file_id":          file_id,
-        "file_version_id":  file_version_id,
-        "upload_url":       signed.get("signedURL") or signed.get("signedUrl") or signed.get("signed_url"),
-        "upload_token":     signed.get("token"),
-        "storage_path":     storage_path,
-    }
+    signed = sb.storage.from_("company-files").create_signed_upload_url(path)
+    return {"file_id":fid,"file_version_id":vid,
+            "upload_url":signed.get("signedURL") or signed.get("signedUrl"),
+            "upload_token":signed.get("token"),"storage_path":path}
 
-class ConfirmUploadBody(BaseModel):
+class ConfirmReq(BaseModel):
     file_version_id: str
 
 @app.post("/upload/confirm")
-def confirm_upload(body: ConfirmUploadBody, user=Depends(get_current_user)):
-    sb = get_supabase()
-    version = sb.table("file_versions").select("*")\
-        .eq("id", body.file_version_id).eq("company_id", user["company_id"])\
-        .single().execute()
-    if not version.data:
-        raise HTTPException(status_code=404, detail="File version not found")
-    sb.table("file_versions").update({"status": "queued"})\
-        .eq("id", body.file_version_id).execute()
-    job_id = str(uuid.uuid4())
-    sb.table("processing_jobs").insert({
-        "id": job_id, "company_id": user["company_id"],
-        "file_version_id": body.file_version_id,
-        "job_type": "ingest", "status": "queued", "priority": 5,
-    }).execute()
-    return {"job_id": job_id, "status": "queued"}
+async def upload_confirm(b: ConfirmReq, u=Depends(get_user)):
+    cid = str(u["company_id"])
+    jid = str(uuid.uuid4())
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            row = await c.fetchrow(
+                "SELECT id FROM file_versions WHERE id=$1 AND company_id=$2",
+                uuid.UUID(b.file_version_id), uuid.UUID(cid))
+            if not row:
+                raise HTTPException(404, "File version not found")
+            await c.execute("UPDATE file_versions SET status='queued' WHERE id=$1",
+                            uuid.UUID(b.file_version_id))
+            await c.execute(
+                "INSERT INTO processing_jobs(id,company_id,file_version_id,job_type,status,priority)"
+                " VALUES($1,$2,$3,'ingest','queued',5)",
+                uuid.UUID(jid), uuid.UUID(cid), uuid.UUID(b.file_version_id))
+    else:
+        sb = _sb()
+        sb.table("file_versions").update({"status":"queued"}).eq("id",b.file_version_id).execute()
+        sb.table("processing_jobs").insert({"id":jid,"company_id":cid,
+            "file_version_id":b.file_version_id,"job_type":"ingest","status":"queued","priority":5}).execute()
+    return {"job_id":jid,"status":"queued"}
 
 # ── Files ──────────────────────────────────────────────────────────────────────
 
 @app.get("/files")
-def list_files(user=Depends(get_current_user)):
-    sb = get_supabase()
-    files = sb.table("files")\
-        .select("*, file_versions(id, status, original_filename, created_at, size_bytes, error_message)")\
-        .eq("company_id", user["company_id"]).is_("deleted_at", "null")\
-        .order("created_at", desc=True).execute()
-    return files.data
+async def list_files(u=Depends(get_user)):
+    cid = uuid.UUID(str(u["company_id"]))
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """SELECT f.id,f.logical_name,f.created_at,
+                   json_agg(json_build_object('id',fv.id,'status',fv.status,
+                     'original_filename',fv.original_filename,'size_bytes',fv.size_bytes,
+                     'created_at',fv.created_at,'error_message',fv.error_message)
+                   ORDER BY fv.created_at DESC) AS file_versions
+                   FROM files f LEFT JOIN file_versions fv ON fv.file_id=f.id
+                   WHERE f.company_id=$1 AND f.deleted_at IS NULL
+                   GROUP BY f.id ORDER BY f.created_at DESC""", cid)
+            return [dict(r) for r in rows]
+    sb  = _sb()
+    res = sb.table("files").select("*,file_versions(id,status,original_filename,size_bytes,created_at,error_message)")\
+          .eq("company_id",str(cid)).is_("deleted_at","null").order("created_at",desc=True).execute()
+    return res.data
 
 class FileIdsBody(BaseModel):
-    file_ids: List[str]
-
+    file_ids: list[str]
 
 @app.post("/files/delete")
-def delete_files(body: FileIdsBody, user=Depends(get_current_user)):
+async def delete_files(body: FileIdsBody, u=Depends(get_user)):
     """
     Hard-deletes selected files:
     - Supabase Storage objects
@@ -163,8 +220,8 @@ def delete_files(body: FileIdsBody, user=Depends(get_current_user)):
     - file_versions
     - files
     """
-    sb = get_supabase()
-    company_id = user["company_id"]
+    sb         = _sb()
+    company_id = str(u["company_id"])
 
     file_ids = list({fid for fid in body.file_ids if fid})
     if not file_ids:
@@ -172,418 +229,408 @@ def delete_files(body: FileIdsBody, user=Depends(get_current_user)):
 
     # Verify files belong to user's company
     owned_files = sb.table("files")\
-        .select("id")\
-        .eq("company_id", company_id)\
-        .in_("id", file_ids)\
-        .execute().data or []
-
+        .select("id").eq("company_id", company_id)\
+        .in_("id", file_ids).execute().data or []
     owned_file_ids = [f["id"] for f in owned_files]
-
     if not owned_file_ids:
-        raise HTTPException(status_code=404, detail="No matching files found")
+        raise HTTPException(404, "No matching files found")
 
     # Get versions + storage paths
     versions = sb.table("file_versions")\
-        .select("id, file_id, storage_bucket, storage_path, status")\
+        .select("id,file_id,storage_bucket,storage_path,status")\
         .eq("company_id", company_id)\
-        .in_("file_id", owned_file_ids)\
-        .execute().data or []
+        .in_("file_id", owned_file_ids).execute().data or []
 
-    version_ids = [v["id"] for v in versions]
+    version_ids  = [v["id"] for v in versions]
     storage_items = [
-        {
-            "bucket": v.get("storage_bucket") or "company-files",
-            "path": v["storage_path"],
-        }
-        for v in versions
-        if v.get("storage_path")
+        {"bucket": v.get("storage_bucket") or "company-files", "path": v["storage_path"]}
+        for v in versions if v.get("storage_path")
     ]
 
     # Avoid deleting files while actively being processed
     active_statuses = {"parsing", "chunking", "embedding"}
     active = [v for v in versions if v.get("status") in active_statuses]
     if active:
-        raise HTTPException(
-            status_code=409,
-            detail="One or more files are currently processing. Wait until processing finishes, then delete."
-        )
+        raise HTTPException(409,
+            "One or more files are currently processing. Wait until processing finishes, then delete.")
 
     # Remove storage objects first
-    paths_by_bucket = {}
+    paths_by_bucket: dict = {}
     for item in storage_items:
         paths_by_bucket.setdefault(item["bucket"], []).append(item["path"])
-
     for bucket, paths in paths_by_bucket.items():
         if paths:
             sb.storage.from_(bucket).remove(paths)
 
-    # Delete citations that point at chunks from these files
-    chunks = sb.table("file_chunks")\
-        .select("id")\
-        .eq("company_id", company_id)\
-        .in_("file_id", owned_file_ids)\
-        .execute().data or []
-
-    chunk_ids = [c["id"] for c in chunks]
-
+    # Delete citations linked to chunks from these files
+    chunks_rows = sb.table("file_chunks")\
+        .select("id").eq("company_id", company_id)\
+        .in_("file_id", owned_file_ids).execute().data or []
+    chunk_ids = [c["id"] for c in chunks_rows]
     if chunk_ids:
-        # Batch in case there are many chunks
         for i in range(0, len(chunk_ids), 100):
-            sb.table("citations")\
-                .delete()\
-                .in_("chunk_id", chunk_ids[i:i + 100])\
-                .execute()
+            sb.table("citations").delete()\
+                .in_("chunk_id", chunk_ids[i:i+100]).execute()
 
     # Delete jobs
     if version_ids:
-        sb.table("processing_jobs")\
-            .delete()\
+        sb.table("processing_jobs").delete()\
             .eq("company_id", company_id)\
-            .in_("file_version_id", version_ids)\
-            .execute()
+            .in_("file_version_id", version_ids).execute()
 
     # Delete chunks
-    sb.table("file_chunks")\
-        .delete()\
+    sb.table("file_chunks").delete()\
         .eq("company_id", company_id)\
-        .in_("file_id", owned_file_ids)\
-        .execute()
+        .in_("file_id", owned_file_ids).execute()
 
     # Delete versions
-    sb.table("file_versions")\
-        .delete()\
+    sb.table("file_versions").delete()\
         .eq("company_id", company_id)\
-        .in_("file_id", owned_file_ids)\
-        .execute()
+        .in_("file_id", owned_file_ids).execute()
 
     # Delete files
-    sb.table("files")\
-        .delete()\
+    sb.table("files").delete()\
         .eq("company_id", company_id)\
-        .in_("id", owned_file_ids)\
-        .execute()
+        .in_("id", owned_file_ids).execute()
 
-    return {
-        "deleted_count": len(owned_file_ids),
-        "deleted_file_ids": owned_file_ids,
-    }
+    return {"deleted_count": len(owned_file_ids), "deleted_file_ids": owned_file_ids}
 
 
 @app.post("/files/download-url")
-def get_download_urls(body: FileIdsBody, user=Depends(get_current_user)):
-    """
-    Returns signed download URLs for selected files.
-    """
-    sb = get_supabase()
-    company_id = user["company_id"]
+async def get_download_urls(body: FileIdsBody, u=Depends(get_user)):
+    """Returns signed download URLs for selected files."""
+    sb         = _sb()
+    company_id = str(u["company_id"])
 
     file_ids = list({fid for fid in body.file_ids if fid})
     if not file_ids:
         return {"files": []}
 
     files = sb.table("files")\
-        .select("id, logical_name, current_file_version_id")\
+        .select("id,logical_name,current_file_version_id")\
         .eq("company_id", company_id)\
-        .in_("id", file_ids)\
-        .execute().data or []
-
+        .in_("id", file_ids).execute().data or []
     if not files:
-        raise HTTPException(status_code=404, detail="No matching files found")
+        raise HTTPException(404, "No matching files found")
 
     current_version_ids = [
         f["current_file_version_id"]
-        for f in files
-        if f.get("current_file_version_id")
+        for f in files if f.get("current_file_version_id")
     ]
 
     versions = []
     if current_version_ids:
         versions = sb.table("file_versions")\
-            .select("id, file_id, storage_bucket, storage_path, original_filename")\
+            .select("id,file_id,storage_bucket,storage_path,original_filename")\
             .eq("company_id", company_id)\
-            .in_("id", current_version_ids)\
-            .execute().data or []
+            .in_("id", current_version_ids).execute().data or []
 
-    # Fallback: if current version missing, use latest version per file
-    found_file_ids = {v["file_id"] for v in versions}
+    # Fallback: use latest version per file if current_file_version_id missing
+    found_file_ids  = {v["file_id"] for v in versions}
     missing_file_ids = [f["id"] for f in files if f["id"] not in found_file_ids]
-
     if missing_file_ids:
-        fallback_versions = sb.table("file_versions")\
-            .select("id, file_id, storage_bucket, storage_path, original_filename, created_at")\
+        fallback = sb.table("file_versions")\
+            .select("id,file_id,storage_bucket,storage_path,original_filename,created_at")\
             .eq("company_id", company_id)\
             .in_("file_id", missing_file_ids)\
-            .order("created_at", desc=True)\
-            .execute().data or []
-
-        seen = set()
-        for v in fallback_versions:
+            .order("created_at", desc=True).execute().data or []
+        seen: set = set()
+        for v in fallback:
             if v["file_id"] not in seen:
                 versions.append(v)
                 seen.add(v["file_id"])
 
     results = []
-
     for v in versions:
         bucket = v.get("storage_bucket") or "company-files"
         signed = sb.storage.from_(bucket).create_signed_url(v["storage_path"], 3600)
-
         results.append({
-            "file_id": v["file_id"],
+            "file_id":         v["file_id"],
             "file_version_id": v["id"],
-            "filename": v.get("original_filename") or "download",
-            "url": signed.get("signedURL") or signed.get("signedUrl") or signed.get("signed_url"),
+            "filename":        v.get("original_filename") or "download",
+            "url":             signed.get("signedURL") or signed.get("signedUrl") or signed.get("signed_url"),
         })
-
     return {"files": results}
+
+
+@app.delete("/files/{file_id}")
+async def delete_file(file_id: str, u=Depends(get_user)):
+    cid = str(u["company_id"])
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            await c.execute("UPDATE files SET deleted_at=now() WHERE id=$1 AND company_id=$2",
+                            uuid.UUID(file_id), uuid.UUID(cid))
+    else:
+        _sb().table("files").update({"deleted_at":datetime.utcnow().isoformat()})\
+             .eq("id",file_id).eq("company_id",cid).execute()
+    return {"deleted":True}
 
 # ── Conversations ──────────────────────────────────────────────────────────────
 
 @app.get("/conversations")
-def list_conversations(user=Depends(get_current_user)):
-    sb = get_supabase()
-    result = sb.table("conversation_sessions")\
-        .select("id, title, message_count, created_at, updated_at")\
-        .eq("user_id", user["id"])\
-        .order("updated_at", desc=True).limit(50).execute()
-    return result.data
+async def list_convos(u=Depends(get_user)):
+    uid = uuid.UUID(str(u["id"]))
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                "SELECT id,title,message_count,created_at,updated_at "
+                "FROM conversation_sessions WHERE user_id=$1 ORDER BY updated_at DESC LIMIT 50", uid)
+            return [dict(r) for r in rows]
+    res = _sb().table("conversation_sessions")\
+          .select("id,title,message_count,created_at,updated_at")\
+          .eq("user_id",str(uid)).order("updated_at",desc=True).limit(50).execute()
+    return res.data
 
 @app.post("/conversations")
-def create_conversation(user=Depends(get_current_user)):
-    sb = get_supabase()
-    session_id = str(uuid.uuid4())
-    sb.table("conversation_sessions").insert({
-        "id": session_id, "company_id": user["company_id"],
-        "user_id": user["id"], "title": "New conversation",
-    }).execute()
-    return {"session_id": session_id, "title": "New conversation"}
+async def create_conversation(u=Depends(get_user)):
+    """Explicitly create a new named conversation session."""
+    sid = str(uuid.uuid4())
+    cid = str(u["company_id"])
+    uid = str(u["id"])
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            await c.execute(
+                "INSERT INTO conversation_sessions(id,company_id,user_id,title,message_count)"
+                " VALUES($1,$2,$3,'New conversation',0)",
+                uuid.UUID(sid), uuid.UUID(cid), uuid.UUID(uid))
+    else:
+        _sb().table("conversation_sessions").insert({
+            "id": sid, "company_id": cid, "user_id": uid, "title": "New conversation",
+        }).execute()
+    return {"session_id": sid, "title": "New conversation"}
 
-@app.get("/conversations/{session_id}/messages")
-def get_messages(session_id: str, user=Depends(get_current_user)):
-    sb = get_supabase()
-    session = sb.table("conversation_sessions")\
-        .select("*").eq("id", session_id).eq("user_id", user["id"])\
-        .single().execute()
-    if not session.data:
-        raise HTTPException(status_code=404, detail="Session not found")
-    messages = sb.table("conversation_messages")\
-        .select("*").eq("session_id", session_id)\
-        .order("created_at", asc=True).execute()
-    return {"session": session.data, "messages": messages.data}
+@app.get("/conversations/{sid}/messages")
+async def get_msgs(sid: str, u=Depends(get_user)):
+    uid  = uuid.UUID(str(u["id"]))
+    sess = uuid.UUID(sid)
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            s = await c.fetchrow("SELECT * FROM conversation_sessions WHERE id=$1 AND user_id=$2",sess,uid)
+            if not s: raise HTTPException(404,"Session not found")
+            m = await c.fetch("SELECT * FROM conversation_messages WHERE session_id=$1 ORDER BY created_at",sess)
+            return {"session":dict(s),"messages":[dict(x) for x in m]}
+    sb  = _sb()
+    s   = sb.table("conversation_sessions").select("*").eq("id",sid).eq("user_id",str(uid)).single().execute()
+    if not s.data: raise HTTPException(404,"Session not found")
+    m   = sb.table("conversation_messages").select("*").eq("session_id",sid).order("created_at",asc=True).execute()
+    return {"session":s.data,"messages":m.data}
 
-@app.delete("/conversations/{session_id}")
-def delete_conversation(session_id: str, user=Depends(get_current_user)):
-    sb = get_supabase()
-    sb.table("conversation_sessions")\
-        .delete().eq("id", session_id).eq("user_id", user["id"]).execute()
-    return {"deleted": True}
+@app.delete("/conversations/{sid}")
+async def del_convo(sid: str, u=Depends(get_user)):
+    uid = uuid.UUID(str(u["id"]))
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            await c.execute("DELETE FROM conversation_sessions WHERE id=$1 AND user_id=$2",uuid.UUID(sid),uid)
+    else:
+        _sb().table("conversation_sessions").delete().eq("id",sid).eq("user_id",str(uid)).execute()
+    return {"deleted":True}
 
-# ── Ask ────────────────────────────────────────────────────────────────────────
+# ── Context builder ────────────────────────────────────────────────────────────
 
-SYSTEM_PROMPT = """You are PatchBrain, an AI assistant built specifically for oilfield service companies.
-You answer questions ONLY from the provided source documents.
+SYSTEM_PROMPT = """You are PatchBrain, an AI assistant for oilfield service companies.
+Answer ONLY from the provided sources.
+- Cite every claim with [S1], [S2] etc. and mention the filename.
+- If sources conflict, say so explicitly.
+- If you cannot answer from sources: "I don't have enough information in the uploaded files."
+- Never invent numbers, names, dates, or ticket IDs.
+- For calculations, show your work step by step.
+- Be direct — oilfield operators are busy."""
 
-Rules:
-- Cite every factual claim with the source tag [S1], [S2] etc.
-- Always mention the filename the answer came from.
-- If two sources conflict, say so explicitly.
-- If sources don't contain enough to answer confidently, say so clearly.
-- Never invent numbers, dates, names, or ticket numbers.
-- For calculations show your work step by step.
-- Keep answers direct and concise — oilfield operators are busy.
-- When the user refers to something from earlier in the conversation, use the conversation history provided."""
+def _build_context(session: dict, recent: list) -> str:
+    parts = []
+    if session.get("summary"):
+        parts.append(f"[Earlier conversation summary]\n{session['summary']}")
+    if recent:
+        lines = ["[Recent messages]"]
+        for m in recent[-10:]:
+            label = "User" if m.get("role") == "user" else "PatchBrain"
+            lines.append(f"{label}: {(m.get('content') or '')[:400]}")
+        parts.append("\n".join(lines))
+    return "\n\n".join(parts)
+
+async def _maybe_summarize(sid: uuid.UUID, uid: uuid.UUID,
+                           count: int, history: str):
+    if count < 20 or count % 20 != 0:
+        return
+    try:
+        r = await ant.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=300,
+            messages=[{"role":"user","content":
+                f"Summarize this conversation in 150 words keeping all key facts and numbers:\n\n{history}"}])
+        summ = r.content[0].text
+        if DB_POOL:
+            async with DB_POOL.acquire() as c:
+                await c.execute("UPDATE conversation_sessions SET summary=$1 WHERE id=$2", summ, sid)
+        else:
+            _sb().table("conversation_sessions").update({"summary":summ}).eq("id",str(sid)).execute()
+    except Exception as e:
+        print(f"Summarize failed (non-critical): {e}")
+
+# ── /ask  (streaming) ──────────────────────────────────────────────────────────
 
 class AskBody(BaseModel):
     question:   str
     session_id: Optional[str] = None
 
 @app.post("/ask")
-def ask(body: AskBody, user=Depends(get_current_user)):
-    sb         = get_supabase()
-    company_id = user["company_id"]
-    question   = body.question.strip()
+async def ask(b: AskBody, u=Depends(get_user)):
+    cid  = uuid.UUID(str(u["company_id"]))
+    uid  = uuid.UUID(str(u["id"]))
+    q    = b.question.strip()
+    sid  = uuid.UUID(b.session_id) if b.session_id else uuid.uuid4()
+    sids = str(sid)
 
-    # ── 1. Get or create session ──
-    session_id = body.session_id
-    if not session_id:
-        session_id = str(uuid.uuid4())
-        sb.table("conversation_sessions").insert({
-            "id": session_id, "company_id": company_id,
-            "user_id": user["id"], "title": question[:60],
-        }).execute()
+    # Load / create session + recent messages
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            srow = await c.fetchrow(
+                "SELECT * FROM conversation_sessions WHERE id=$1 AND user_id=$2", sid, uid)
+            if not srow:
+                await c.execute(
+                    "INSERT INTO conversation_sessions(id,company_id,user_id,title,message_count)"
+                    " VALUES($1,$2,$3,$4,0)", sid, cid, uid, q[:60])
+                srow = {"id":sid,"summary":None,"message_count":0,"title":q[:60]}
+            else:
+                srow = dict(srow)
+            recent = list(reversed([dict(r) for r in await c.fetch(
+                "SELECT role,content FROM conversation_messages "
+                "WHERE session_id=$1 ORDER BY created_at DESC LIMIT 10", sid)]))
+    else:
+        sb   = _sb()
+        sr   = sb.table("conversation_sessions").select("*").eq("id",sids).eq("user_id",str(uid)).single().execute()
+        if not sr.data:
+            sb.table("conversation_sessions").insert({"id":sids,"company_id":str(cid),
+                "user_id":str(uid),"title":q[:60],"message_count":0}).execute()
+            srow = {"id":sids,"summary":None,"message_count":0,"title":q[:60]}
+        else:
+            srow = sr.data
+        recent = list(reversed((sb.table("conversation_messages").select("role,content")
+                   .eq("session_id",sids).order("created_at",desc=True).limit(10).execute().data or [])))
 
-    session_row = sb.table("conversation_sessions")\
-        .select("*").eq("id", session_id).eq("user_id", user["id"])\
-        .single().execute().data
-    if not session_row:
-        raise HTTPException(status_code=404, detail="Session not found")
+    history    = _build_context(srow, recent)
+    new_count  = (srow.get("message_count") or 0) + 2
 
-    # ── 2. Load conversation history (last 10 messages + rolling summary) ──
-    recent_rows = sb.table("conversation_messages")\
-        .select("role, content").eq("session_id", session_id)\
-        .order("created_at", desc=True).limit(10).execute().data or []
-    recent_rows.reverse()
-
-    history_text = ""
-    if session_row.get("summary"):
-        history_text += f"[Summary of earlier conversation]\n{session_row['summary']}\n\n"
-    if recent_rows:
-        history_text += "[Recent messages]\n"
-        for m in recent_rows:
-            label = "User" if m["role"] == "user" else "PatchBrain"
-            history_text += f"{label}: {m['content'][:500]}\n"
-
-    # ── 3. Embed question ──
+    # Embed
     try:
-        embed_resp = openai_client.embeddings.create(
-            model="text-embedding-3-small", input=question)
+        emb = await ai.embeddings.create(model="text-embedding-3-small", input=q)
     except Exception as e:
         err = str(e).lower()
-        if any(w in err for w in ["quota", "billing", "insufficient", "credit"]):
-            raise HTTPException(status_code=402,
-                detail="OpenAI billing issue — add credits at platform.openai.com")
-        raise HTTPException(status_code=500, detail=f"Embedding error: {str(e)}")
+        if any(w in err for w in ["quota","billing","insufficient"]):
+            raise HTTPException(402, "OpenAI billing issue — add credits at platform.openai.com")
+        raise HTTPException(500, f"Embedding error: {e}")
 
-    query_embedding = embed_resp.data[0].embedding
+    # Search
+    sb     = _sb()
+    chunks = (sb.rpc("hybrid_search",{
+        "p_company_id":str(cid),"p_query_embedding":emb.data[0].embedding,
+        "p_query_text":q,"p_match_count":10}).execute().data or [])
 
-    # ── 4. Hybrid search (60% text, 40% vector for oilfield exact matches) ──
-    chunks = sb.rpc("hybrid_search", {
-        "p_company_id":      company_id,
-        "p_query_embedding": query_embedding,
-        "p_query_text":      question,
-        "p_match_count":     12,
-    }).execute().data or []
+    # Filenames
+    fname_map: dict = {}
+    if chunks:
+        fv_ids = list({c["file_version_id"] for c in chunks if c.get("file_version_id")})
+        if DB_POOL:
+            async with DB_POOL.acquire() as c:
+                rows = await c.fetch("SELECT id,original_filename FROM file_versions WHERE id=ANY($1)",
+                                     [uuid.UUID(x) for x in fv_ids])
+                fname_map = {str(r["id"]): r["original_filename"] for r in rows}
+        else:
+            for r in (sb.table("file_versions").select("id,original_filename").in_("id",fv_ids).execute().data or []):
+                fname_map[r["id"]] = r["original_filename"]
+
+    # Source blocks
+    src_blocks = []
+    citations  = []
+    for i, chunk in enumerate(chunks[:8], 1):
+        fname = fname_map.get(chunk.get("file_version_id",""), "unknown")
+        st    = chunk.get("source_type","")
+        lines = [f"File: {fname}"]
+        if st in ("pdf_text","pdf_table"):    lines.append(f"Page: {chunk.get('page_number','?')}")
+        elif st == "sheet_rows":              lines.append(f"Sheet: {chunk.get('sheet_name','?')}, rows {chunk.get('row_start','?')}–{chunk.get('row_end','?')}")
+        elif st == "whatsapp_message":        lines.append(f"WhatsApp — {(chunk.get('metadata_jsonb') or {}).get('sender','unknown')}")
+        lines.append(f"Content:\n{(chunk.get('content') or '')[:600]}")
+        src_blocks.append(f"[S{i}]\n"+"\n".join(lines))
+        citations.append({"index":i,"chunk_id":chunk["chunk_id"],"source_type":st,
+            "page_number":chunk.get("page_number"),"sheet_name":chunk.get("sheet_name"),
+            "row_start":chunk.get("row_start"),"row_end":chunk.get("row_end"),
+            "filename":fname,"preview":(chunk.get("content") or "")[:300],
+            "score":chunk.get("combined_score")})
 
     if not chunks:
-        # Save the question even if no results
-        sb.table("conversation_messages").insert([
-            {"session_id": session_id, "company_id": company_id, "user_id": user["id"],
-             "role": "user", "content": question},
-            {"session_id": session_id, "company_id": company_id, "user_id": user["id"],
-             "role": "assistant",
-             "content": "I don't have enough information in the uploaded files to answer that confidently."},
-        ]).execute()
-        sb.table("conversation_sessions").update({
-            "message_count": (session_row.get("message_count") or 0) + 2,
-            "updated_at": datetime.utcnow().isoformat(),
-        }).eq("id", session_id).execute()
-        return {
-            "answer":     "I don't have enough information in the uploaded files to answer that confidently.",
-            "citations":  [],
-            "session_id": session_id,
-        }
+        async def no_data():
+            yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
+            msg = "I don't have enough information in the uploaded files to answer that confidently."
+            yield f"data: {json.dumps({'type':'token','text':msg})}\n\n"
+            yield f"data: {json.dumps({'type':'done','citations':[]})}\n\n"
+        return StreamingResponse(no_data(), media_type="text/event-stream")
 
-    # ── 5. Get filenames ──
-    fv_ids = list({c["file_version_id"] for c in chunks if c.get("file_version_id")})
-    filename_map = {}
-    if fv_ids:
-        rows = sb.table("file_versions").select("id, original_filename")\
-            .in_("id", fv_ids).execute().data or []
-        filename_map = {r["id"]: r["original_filename"] for r in rows}
+    user_msg = (f"Conversation context:\n{history}\n\n" if history else "")
+    user_msg += f"Current question: {q}\n\nSources:\n" + "\n\n---\n\n".join(src_blocks)
 
-    # ── 6. Build source blocks ──
-    source_blocks = []
-    for i, chunk in enumerate(chunks[:10], start=1):
-        fname = filename_map.get(chunk.get("file_version_id"), "unknown file")
-        lines = [f"File: {fname}"]
-        st = chunk.get("source_type", "")
-        if st in ("pdf_text", "pdf_table"):
-            lines.append(f"Page: {chunk.get('page_number', '?')}")
-        elif st == "sheet_rows":
-            lines.append(f"Sheet: {chunk.get('sheet_name','?')}, rows {chunk.get('row_start','?')}–{chunk.get('row_end','?')}")
-        lines.append(f"Content:\n{(chunk.get('content') or '')[:800]}")
-        source_blocks.append(f"[S{i}]\n" + "\n".join(lines))
-
-    sources_text = "\n\n---\n\n".join(source_blocks)
-
-    # ── 7. Build user message ──
-    user_msg = ""
-    if history_text:
-        user_msg += f"Conversation context:\n{history_text}\n\n"
-    user_msg += f"Current question: {question}\n\nSources:\n{sources_text}"
-
-    # ── 8. Call Claude with prompt caching ──
-    try:
-        response = claude_client.messages.create(
-            model=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
-            max_tokens=1024,
-            system=[{
-                "type": "text",
-                "text": SYSTEM_PROMPT,
-                "cache_control": {"type": "ephemeral"}
-            }],
-            messages=[{"role": "user", "content": user_msg}],
-        )
-    except anthropic.APIStatusError as e:
-        if e.status_code in (402, 403) or any(w in str(e).lower() for w in ["credit", "billing"]):
-            raise HTTPException(status_code=402,
-                detail="Anthropic billing issue — add credits at console.anthropic.com")
-        if e.status_code == 529:
-            raise HTTPException(status_code=503, detail="Claude is overloaded — try again shortly")
-        raise HTTPException(status_code=500, detail=f"Claude error: {str(e)}")
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"AI error: {str(e)}")
-
-    answer_text = response.content[0].text
-
-    # ── 9. Save messages ──
-    citations_json = [{
-        "index": i+1, "chunk_id": c["chunk_id"],
-        "source_type": c.get("source_type"), "page_number": c.get("page_number"),
-        "sheet_name": c.get("sheet_name"), "row_start": c.get("row_start"),
-        "row_end": c.get("row_end"),
-        "filename": filename_map.get(c.get("file_version_id"), ""),
-        "score": c.get("combined_score"),
-    } for i, c in enumerate(chunks[:10])]
-
-    sb.table("conversation_messages").insert([
-        {"session_id": session_id, "company_id": company_id, "user_id": user["id"],
-         "role": "user", "content": question},
-        {"session_id": session_id, "company_id": company_id, "user_id": user["id"],
-         "role": "assistant", "content": answer_text,
-         "citations_json": citations_json,
-         "tokens_used": response.usage.input_tokens + response.usage.output_tokens},
-    ]).execute()
-
-    # ── 10. Update session + rolling summary every 20 messages ──
-    new_count = (session_row.get("message_count") or 0) + 2
-    update: dict = {
-        "message_count": new_count,
-        "updated_at": datetime.utcnow().isoformat(),
-    }
-    if session_row.get("title") == "New conversation":
-        update["title"] = question[:60]
-
-    if new_count >= 20 and new_count % 20 == 0:
+    async def stream_answer() -> AsyncGenerator[str, None]:
+        full        = ""
+        tokens_used = 0
+        yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
         try:
-            sum_resp = claude_client.messages.create(
-                model=os.environ.get("ANTHROPIC_SUMMARY_MODEL", "claude-haiku-4-5-20251001"),
-                max_tokens=300,
-                messages=[{"role": "user",
-                    "content": f"Summarize this conversation in 150 words, keeping all key facts, numbers, and decisions:\n\n{history_text}"}]
-            )
-            update["summary"] = sum_resp.content[0].text
-        except Exception:
-            pass
+            async with ant.messages.stream(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1024,
+                system=[{"type":"text","text":SYSTEM_PROMPT,
+                         "cache_control":{"type":"ephemeral"}}],
+                messages=[{"role":"user","content":user_msg}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    full += text
+                    yield f"data: {json.dumps({'type':'token','text':text})}\n\n"
+                final_msg   = await stream.get_final_message()
+                tokens_used = final_msg.usage.input_tokens + final_msg.usage.output_tokens
+        except anthropic.APIStatusError as e:
+            msg = "Anthropic billing issue — add credits at console.anthropic.com" \
+                  if e.status_code in (402,403) else f"Claude error: {e}"
+            yield f"data: {json.dumps({'type':'error','message':msg})}\n\n"
+            return
+        except Exception as e:
+            yield f"data: {json.dumps({'type':'error','message':str(e)})}\n\n"
+            return
 
-    sb.table("conversation_sessions").update(update).eq("id", session_id).execute()
+        yield f"data: {json.dumps({'type':'done','citations':citations})}\n\n"
 
-    # ── 11. Return ──
-    return {
-        "answer":     answer_text,
-        "session_id": session_id,
-        "citations": [{
-            "index": i+1, "chunk_id": c["chunk_id"],
-            "source_type": c.get("source_type"),
-            "page_number": c.get("page_number"),
-            "sheet_name": c.get("sheet_name"),
-            "row_start": c.get("row_start"), "row_end": c.get("row_end"),
-            "filename": filename_map.get(c.get("file_version_id"), ""),
-            "preview": (c.get("content") or "")[:300],
-            "score": c.get("combined_score"),
-        } for i, c in enumerate(chunks[:10])],
-    }
+        # Save after streaming — non-blocking
+        asyncio.create_task(_save(sid, cid, uid, q, full, citations, new_count, history, srow, tokens_used))
+
+    return StreamingResponse(stream_answer(), media_type="text/event-stream",
+                             headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"})
+
+async def _save(sid, cid, uid, q, answer, citations, count, history, srow, tokens_used=0):
+    try:
+        if DB_POOL:
+            async with DB_POOL.acquire() as c:
+                await c.execute(
+                    "INSERT INTO conversation_messages(id,session_id,company_id,user_id,role,content)"
+                    " VALUES($1,$2,$3,$4,'user',$5)",
+                    uuid.uuid4(),sid,cid,uid,q)
+                await c.execute(
+                    "INSERT INTO conversation_messages(id,session_id,company_id,user_id,role,content,citations_json,tokens_used)"
+                    " VALUES($1,$2,$3,$4,'assistant',$5,$6,$7)",
+                    uuid.uuid4(),sid,cid,uid,answer,json.dumps(citations),tokens_used)
+                upd = "UPDATE conversation_sessions SET message_count=$1,updated_at=now()"
+                args = [count, sid]
+                if srow.get("title") in (None,"New conversation"):
+                    upd += ",title=$3"; args.append(q[:60])
+                await c.execute(upd+" WHERE id=$2" if len(args)==2 else upd+" WHERE id=$2", *args)
+        else:
+            sb = _sb()
+            sb.table("conversation_messages").insert([
+                {"session_id":str(sid),"company_id":str(cid),"user_id":str(uid),"role":"user","content":q},
+                {"session_id":str(sid),"company_id":str(cid),"user_id":str(uid),"role":"assistant",
+                 "content":answer,"citations_json":citations,"tokens_used":tokens_used}]).execute()
+            upd: dict = {"message_count":count,"updated_at":datetime.utcnow().isoformat()}
+            if srow.get("title") in (None,"New conversation"): upd["title"] = q[:60]
+            sb.table("conversation_sessions").update(upd).eq("id",str(sid)).execute()
+        await _maybe_summarize(sid,uid,count,history)
+    except Exception as e:
+        print(f"_save error: {e}")
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "version": "2.0.0"}
+async def health():
+    return {"status":"ok","version":"3.0.0","pool": DB_POOL is not None}
