@@ -9,7 +9,8 @@ import uuid
 import json
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, date
+from decimal import Decimal
 from typing import Optional, AsyncGenerator
 
 import asyncpg
@@ -92,6 +93,21 @@ _SB_CLIENT: Client = create_client(
 
 ai   = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 ant  = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
+
+def _jsonable(value):
+    """Convert asyncpg/Supabase values that JSON cannot serialize by default."""
+    if isinstance(value, Decimal):
+        return float(value)
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, uuid.UUID):
+        return str(value)
+    if isinstance(value, list):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, dict):
+        return {k: _jsonable(v) for k, v in value.items()}
+    return value
+
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
@@ -1201,6 +1217,189 @@ async def _save(sid, cid, uid, q, answer, citations, count, history, srow, token
         await _maybe_summarize(sid,uid,count,history)
     except Exception as e:
         print(f"_save error: {e}")
+
+
+# ── Invoice extraction review API ──────────────────────────────────────────────
+# This is the review/edit surface for structured invoice extraction.
+# It does not run extraction by itself. The worker/extractor will populate these tables later.
+
+class InvoicePatch(BaseModel):
+    invoice_number: Optional[str] = None
+    invoice_date: Optional[str] = None
+    due_date: Optional[str] = None
+    vendor_name: Optional[str] = None
+    customer_name: Optional[str] = None
+    lease_or_well: Optional[str] = None
+    job_number: Optional[str] = None
+    ticket_number: Optional[str] = None
+    subtotal: Optional[float] = None
+    tax: Optional[float] = None
+    total_amount: Optional[float] = None
+    currency: Optional[str] = None
+    extraction_confidence: Optional[float] = None
+    requires_human_review: Optional[bool] = None
+    review_status: Optional[str] = None
+    extraction_error: Optional[str] = None
+
+
+def _is_admin_or_owner(u: dict) -> bool:
+    return (u.get("role") or "").lower() in {"owner", "admin"}
+
+
+@app.get("/extractions/invoices")
+async def list_invoice_extractions(
+    review_status: Optional[str] = None,
+    requires_review: Optional[bool] = None,
+    limit: int = 50,
+    u=Depends(get_user),
+):
+    """List structured invoice records for the user's company."""
+    cid = uuid.UUID(str(u["company_id"]))
+    limit = max(1, min(limit, 200))
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            conditions = ["ir.company_id=$1"]
+            args = [cid]
+            idx = 2
+            if review_status:
+                conditions.append(f"ir.review_status=${idx}")
+                args.append(review_status)
+                idx += 1
+            if requires_review is not None:
+                conditions.append(f"ir.requires_human_review=${idx}")
+                args.append(requires_review)
+                idx += 1
+
+            sql = f"""
+                select
+                  ir.*,
+                  fv.original_filename as filename,
+                  count(ili.id)::int as line_item_count
+                from invoice_records ir
+                left join file_versions fv on fv.id = ir.file_version_id
+                left join invoice_line_items ili on ili.invoice_record_id = ir.id
+                where {' and '.join(conditions)}
+                group by ir.id, fv.original_filename
+                order by ir.created_at desc
+                limit ${idx}
+            """
+            args.append(limit)
+            rows = await c.fetch(sql, *args)
+            return [_jsonable(dict(r)) for r in rows]
+
+    sb = _sb()
+    q = sb.table("invoice_records").select("*").eq("company_id", str(cid)).order("created_at", desc=True).limit(limit)
+    if review_status:
+        q = q.eq("review_status", review_status)
+    if requires_review is not None:
+        q = q.eq("requires_human_review", requires_review)
+    return q.execute().data or []
+
+
+@app.get("/extractions/invoices/{invoice_id}")
+async def get_invoice_extraction(invoice_id: str, u=Depends(get_user)):
+    """Return one invoice extraction plus line items."""
+    cid = uuid.UUID(str(u["company_id"]))
+    iid = uuid.UUID(invoice_id)
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rec = await c.fetchrow(
+                """
+                select ir.*, fv.original_filename as filename
+                from invoice_records ir
+                left join file_versions fv on fv.id = ir.file_version_id
+                where ir.id=$1 and ir.company_id=$2
+                """,
+                iid, cid,
+            )
+            if not rec:
+                raise HTTPException(404, "Invoice extraction not found")
+
+            items = await c.fetch(
+                """
+                select *
+                from invoice_line_items
+                where invoice_record_id=$1 and company_id=$2
+                order by line_number nulls last, created_at asc
+                """,
+                iid, cid,
+            )
+            out = _jsonable(dict(rec))
+            out["line_items"] = [_jsonable(dict(x)) for x in items]
+            return out
+
+    sb = _sb()
+    rec = sb.table("invoice_records").select("*").eq("id", invoice_id).eq("company_id", str(cid)).single().execute()
+    if not rec.data:
+        raise HTTPException(404, "Invoice extraction not found")
+    items = sb.table("invoice_line_items").select("*").eq("invoice_record_id", invoice_id).eq("company_id", str(cid)).order("line_number", desc=False).execute().data or []
+    out = rec.data
+    out["line_items"] = items
+    return out
+
+
+@app.patch("/extractions/invoices/{invoice_id}")
+async def update_invoice_extraction(invoice_id: str, patch: InvoicePatch, u=Depends(get_user)):
+    """Admin/owner review endpoint for correcting structured invoice fields."""
+    if not _is_admin_or_owner(u):
+        raise HTTPException(403, "Only owner/admin users can review invoice extractions.")
+
+    cid = uuid.UUID(str(u["company_id"]))
+    iid = uuid.UUID(invoice_id)
+
+    allowed_review_statuses = {"pending", "approved", "corrected", "rejected"}
+    data = patch.model_dump(exclude_unset=True)
+
+    if "review_status" in data and data["review_status"] not in allowed_review_statuses:
+        raise HTTPException(400, "review_status must be pending, approved, corrected, or rejected")
+
+    if "currency" in data and data["currency"]:
+        data["currency"] = data["currency"].upper()[:3]
+
+    # Any manual patch means the record has been reviewed/corrected unless caller explicitly rejects/approves it.
+    data["reviewed_by"] = str(u["id"])
+    data["reviewed_at"] = datetime.utcnow().isoformat()
+    data["updated_at"] = datetime.utcnow().isoformat()
+    if "review_status" not in data:
+        data["review_status"] = "corrected"
+    if data.get("review_status") in {"approved", "corrected"}:
+        data["requires_human_review"] = False
+
+    if DB_POOL:
+        if not data:
+            raise HTTPException(400, "No fields to update")
+
+        columns = []
+        args = []
+        idx = 1
+        for key, value in data.items():
+            columns.append(f"{key}=${idx}")
+            if key in {"reviewed_by"} and value:
+                args.append(uuid.UUID(str(value)))
+            else:
+                args.append(value)
+            idx += 1
+
+        args.extend([iid, cid])
+        sql = f"""
+            update invoice_records
+            set {', '.join(columns)}
+            where id=${idx} and company_id=${idx + 1}
+            returning *
+        """
+        async with DB_POOL.acquire() as c:
+            row = await c.fetchrow(sql, *args)
+            if not row:
+                raise HTTPException(404, "Invoice extraction not found")
+            return _jsonable(dict(row))
+
+    sb = _sb()
+    updated = sb.table("invoice_records").update(data).eq("id", invoice_id).eq("company_id", str(cid)).execute().data or []
+    if not updated:
+        raise HTTPException(404, "Invoice extraction not found")
+    return updated[0]
 
 @app.get("/health")
 async def health():
