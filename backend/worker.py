@@ -503,6 +503,11 @@ def run_worker():
             print(f"Worker loop error: {e}")
             time.sleep(POLL_INTERVAL)
 
-
+def run_worker():
+    print(f"PatchBrain worker starting — ID: {WORKER_ID}")
+    print(f"Polling every {POLL_INTERVAL}s")
+    print(f"ENABLE_CONTEXTUAL_RETRIEVAL={ENABLE_CONTEXTUAL_RETRIEVAL}")
+    print(f"CONTEXTUALIZATION_MODEL={CONTEXTUALIZATION_MODEL}")
+    print(f"ANTHROPIC_API_KEY_PRESENT={bool(os.environ.get('ANTHROPIC_API_KEY'))}")
 if __name__ == "__main__":
     run_worker()
