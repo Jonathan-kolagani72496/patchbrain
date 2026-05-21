@@ -8,6 +8,7 @@ import os
 import uuid
 import json
 import asyncio
+import time
 from datetime import datetime
 from typing import Optional, AsyncGenerator
 
@@ -600,12 +601,18 @@ def _build_file_inventory_answer(files: list[dict]) -> str:
 
 
 async def _stream_direct_answer(sid: uuid.UUID, cid: uuid.UUID, uid: uuid.UUID, q: str,
-                                answer: str, new_count: int, history: str, srow: dict):
+                                answer: str, new_count: int, history: str, srow: dict,
+                                started_at: float, intent_type: str = "file_inventory"):
     sids = str(sid)
     yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
     yield f"data: {json.dumps({'type':'token','text':answer})}\n\n"
     yield f"data: {json.dumps({'type':'done','citations':[]})}\n\n"
     asyncio.create_task(_save(sid, cid, uid, q, answer, [], new_count, history, srow, 0))
+    asyncio.create_task(_insert_rag_log(
+        cid=cid, uid=uid, sid=sid, question=q, intent_type=intent_type,
+        retrieval_used=False, rerank_used=False, refused=False, refusal_reason=None,
+        chunks=[], fname_map={}, citations_count=0, model=None, tokens_used=0, started_at=started_at,
+    ))
 
 
 def _chunk_doc_for_rerank(chunk: dict, filename: str) -> str:
@@ -712,6 +719,109 @@ def _log_retrieval(question: str, chunks: list[dict], fname_map: dict):
     except Exception:
         pass
 
+
+
+def _safe_float(v):
+    try:
+        if v is None:
+            return None
+        return float(v)
+    except Exception:
+        return None
+
+
+def _build_retrieved_chunks_log(chunks: list[dict], fname_map: dict) -> list[dict]:
+    out = []
+    for rank, c in enumerate(chunks[:20], 1):
+        out.append({
+            "rank": rank,
+            "chunk_id": str(c.get("chunk_id") or ""),
+            "file_id": str(c.get("file_id") or ""),
+            "file_version_id": str(c.get("file_version_id") or ""),
+            "filename": fname_map.get(c.get("file_version_id", ""), "unknown"),
+            "source_type": c.get("source_type"),
+            "page_number": c.get("page_number"),
+            "sheet_name": c.get("sheet_name"),
+            "row_start": c.get("row_start"),
+            "row_end": c.get("row_end"),
+            "combined_score": _safe_float(c.get("combined_score")),
+            "vector_score": _safe_float(c.get("vector_score")),
+            "text_score": _safe_float(c.get("text_score")),
+            "rerank_score": _safe_float(c.get("rerank_score")),
+            "preview": (c.get("content") or "")[:240],
+        })
+    return out
+
+
+async def _insert_rag_log(
+    *,
+    cid: uuid.UUID,
+    uid: uuid.UUID,
+    sid: uuid.UUID,
+    question: str,
+    intent_type: str,
+    retrieval_used: bool,
+    rerank_used: bool,
+    refused: bool,
+    refusal_reason: str | None,
+    chunks: list[dict] | None,
+    fname_map: dict | None,
+    citations_count: int,
+    model: str | None,
+    tokens_used: int,
+    started_at: float,
+):
+    """Best-effort RAG observability. This must never break user-facing chat."""
+    try:
+        chunks = chunks or []
+        fname_map = fname_map or {}
+        top = chunks[0] if chunks else {}
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+
+        row = {
+            "company_id": str(cid),
+            "user_id": str(uid),
+            "session_id": str(sid),
+            "question": question,
+            "intent_type": intent_type,
+            "retrieval_used": retrieval_used,
+            "rerank_used": rerank_used,
+            "refused": refused,
+            "refusal_reason": refusal_reason,
+            "top_combined_score": _safe_float(top.get("combined_score")),
+            "top_vector_score": _safe_float(top.get("vector_score")),
+            "top_text_score": _safe_float(top.get("text_score")),
+            "top_rerank_score": _safe_float(top.get("rerank_score")),
+            "retrieved_chunks_json": _build_retrieved_chunks_log(chunks, fname_map),
+            "citations_count": citations_count,
+            "model": model,
+            "tokens_used": tokens_used or 0,
+            "latency_ms": latency_ms,
+        }
+
+        if DB_POOL:
+            async with DB_POOL.acquire() as c:
+                await c.execute(
+                    """
+                    insert into rag_query_logs(
+                        company_id, user_id, session_id, question, intent_type,
+                        retrieval_used, rerank_used, refused, refusal_reason,
+                        top_combined_score, top_vector_score, top_text_score, top_rerank_score,
+                        retrieved_chunks_json, citations_count, model, tokens_used, latency_ms
+                    )
+                    values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18)
+                    """,
+                    cid, uid, sid, question, intent_type,
+                    retrieval_used, rerank_used, refused, refusal_reason,
+                    row["top_combined_score"], row["top_vector_score"], row["top_text_score"], row["top_rerank_score"],
+                    json.dumps(row["retrieved_chunks_json"]), citations_count, model, tokens_used or 0, latency_ms,
+                )
+        else:
+            _sb().table("rag_query_logs").insert(row).execute()
+    except Exception as e:
+        print(f"rag_query_log failed (non-critical): {e}")
+
+
 # ── /ask  (streaming) ──────────────────────────────────────────────────────────
 
 class AskBody(BaseModel):
@@ -723,6 +833,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
     cid  = uuid.UUID(str(u["company_id"]))
     uid  = uuid.UUID(str(u["id"]))
     q    = b.question.strip()
+    started_at = time.perf_counter()
     sid  = uuid.UUID(b.session_id) if b.session_id else uuid.uuid4()
     sids = str(sid)
 
@@ -800,7 +911,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
         files = await _load_file_inventory(cid)
         answer = _build_file_inventory_answer(files)
         return StreamingResponse(
-            _stream_direct_answer(sid, cid, uid, q, answer, new_count, history, srow),
+            _stream_direct_answer(sid, cid, uid, q, answer, new_count, history, srow, started_at),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"},
         )
@@ -853,6 +964,19 @@ async def ask(b: AskBody, u=Depends(get_user)):
             msg = "I don't have enough information in the uploaded files to answer that confidently."
             yield f"data: {json.dumps({'type':'token','text':msg})}\n\n"
             yield f"data: {json.dumps({'type':'done','citations':[]})}\n\n"
+            asyncio.create_task(_insert_rag_log(
+                cid=cid, uid=uid, sid=sid, question=q, intent_type="rag",
+                retrieval_used=True,
+                rerank_used=any(c.get("rerank_score") is not None for c in chunks),
+                refused=True,
+                refusal_reason="weak_evidence",
+                chunks=chunks,
+                fname_map=fname_map,
+                citations_count=0,
+                model=None,
+                tokens_used=0,
+                started_at=started_at,
+            ))
         return StreamingResponse(weak_evidence(), media_type="text/event-stream")
 
     # Source blocks
@@ -889,8 +1013,9 @@ async def ask(b: AskBody, u=Depends(get_user)):
         tokens_used = 0
         yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
         try:
+            answer_model = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6")
             async with ant.messages.stream(
-                model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
+                model=answer_model,
                 max_tokens=1024,
                 system=[
                     {
@@ -925,6 +1050,19 @@ async def ask(b: AskBody, u=Depends(get_user)):
 
         # Save after streaming — non-blocking
         asyncio.create_task(_save(sid, cid, uid, q, full, citations, new_count, history, srow, tokens_used))
+        asyncio.create_task(_insert_rag_log(
+            cid=cid, uid=uid, sid=sid, question=q, intent_type="rag",
+            retrieval_used=True,
+            rerank_used=any(c.get("rerank_score") is not None for c in chunks),
+            refused=False,
+            refusal_reason=None,
+            chunks=chunks,
+            fname_map=fname_map,
+            citations_count=len(citations),
+            model=answer_model,
+            tokens_used=tokens_used,
+            started_at=started_at,
+        ))
 
     return StreamingResponse(stream_answer(), media_type="text/event-stream",
                              headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"})
@@ -963,6 +1101,43 @@ async def _save(sid, cid, uid, q, answer, citations, count, history, srow, token
 @app.get("/health")
 async def health():
     return {"status":"ok","version":"3.0.0","pool": DB_POOL is not None}
+
+@app.get("/debug/rag-logs")
+async def get_rag_logs(limit: int = 50, u=Depends(get_user)):
+    """Company-scoped RAG observability. Owner/admin only."""
+    if str(u.get("role", "")).lower() not in {"owner", "admin"}:
+        raise HTTPException(403, "Only owner/admin users can view RAG logs")
+
+    limit = max(1, min(limit, 200))
+    cid = uuid.UUID(str(u["company_id"]))
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select *
+                from rag_query_logs
+                where company_id = $1
+                order by created_at desc
+                limit $2
+                """,
+                cid,
+                limit,
+            )
+            return [dict(r) for r in rows]
+
+    rows = (
+        _sb().table("rag_query_logs")
+        .select("*")
+        .eq("company_id", str(cid))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    return rows
+
 @app.get("/conflicts")
 async def list_conflicts(u=Depends(get_user)):
     cid = str(u["company_id"])
