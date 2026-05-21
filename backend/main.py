@@ -485,15 +485,65 @@ async def _maybe_summarize(sid: uuid.UUID, uid: uuid.UUID,
 # ── Retrieval intelligence helpers ────────────────────────────────────────────
 
 FILE_INVENTORY_PATTERNS = (
-    "what files", "which files", "list files", "list my files",
-    "uploaded files", "documents do i have", "files do i have",
-    "files do i have access", "show files", "file library",
+    "what files", "list files", "list my files",
+    "uploaded files", "uploaded documents", "documents do i have",
+    "files do i have", "files do i have access", "show files",
+    "show my files", "file library", "my documents",
+)
+
+FILE_FAILED_PATTERNS = (
+    "failed", "fail", "error", "errors", "upload error", "processing error",
+    "why did my file fail", "why did the file fail", "broken file",
+    "unsupported file", "did not upload", "didn't upload",
+)
+
+FILE_PROCESSING_PATTERNS = (
+    "processing", "still processing", "queued", "parsing", "indexing",
+    "embedding", "not ready", "still running", "being processed",
+)
+
+FILE_READY_PATTERNS = (
+    "ready", "searchable", "available", "can i ask", "can ask",
+    "ready files", "files are ready", "ask questions about",
 )
 
 
+def _normalize_question(q: str) -> str:
+    return " ".join(q.lower().replace("?", "").replace("'", "").split())
+
+
+def _detect_file_status_intent(q: str) -> str | None:
+    """Route product/file-library questions away from RAG.
+
+    Important: do NOT route every question containing "which files".
+    "Which files mention Reeves 14H?" should go through RAG.
+    "Which files failed?" should use database state.
+    """
+    ql = _normalize_question(q)
+
+    talks_about_files = any(x in ql for x in (
+        "file", "files", "document", "documents", "upload", "uploaded", "library"
+    ))
+    if not talks_about_files:
+        return None
+
+    if any(p in ql for p in FILE_FAILED_PATTERNS):
+        return "file_failed_status"
+
+    if any(p in ql for p in FILE_PROCESSING_PATTERNS):
+        return "file_processing_status"
+
+    if any(p in ql for p in FILE_READY_PATTERNS):
+        return "file_ready_status"
+
+    if any(p in ql for p in FILE_INVENTORY_PATTERNS):
+        return "file_inventory"
+
+    return None
+
+
 def _is_file_inventory_question(q: str) -> bool:
-    ql = " ".join(q.lower().replace("?", "").split())
-    return any(p in ql for p in FILE_INVENTORY_PATTERNS)
+    return _detect_file_status_intent(q) is not None
 
 
 def _format_bytes(n) -> str:
@@ -573,28 +623,78 @@ async def _load_file_inventory(company_id: uuid.UUID) -> list[dict]:
     return out
 
 
-def _build_file_inventory_answer(files: list[dict]) -> str:
+PROCESSING_FILE_STATUSES = {"uploaded", "queued", "parsing", "parsed", "chunking", "embedding"}
+
+
+def _file_display_name(f: dict) -> str:
+    return f.get("logical_name") or f.get("original_filename") or "Unnamed file"
+
+
+def _format_file_line(i: int, f: dict, include_error: bool = True) -> str:
+    name = _file_display_name(f)
+    status = f.get("status") or "unknown"
+    size = _format_bytes(f.get("size_bytes"))
+    line = f"{i}. {name} — {status} — {size}"
+    err = f.get("error_message")
+    if include_error and err:
+        line += f" — error: {str(err)[:180]}"
+    return line
+
+
+def _build_file_inventory_answer(files: list[dict], intent_type: str = "file_inventory") -> str:
     if not files:
         return "You do not have any uploaded files yet. Upload files from the dashboard first."
 
-    ready = sum(1 for f in files if f.get("status") == "ready")
-    processing = sum(1 for f in files if f.get("status") in {"uploaded", "queued", "parsing", "parsed", "chunking", "embedding"})
-    failed = sum(1 for f in files if f.get("status") == "failed")
+    ready_files = [f for f in files if f.get("status") == "ready"]
+    processing_files = [f for f in files if f.get("status") in PROCESSING_FILE_STATUSES]
+    failed_files = [f for f in files if f.get("status") == "failed"]
+    other_files = [
+        f for f in files
+        if f.get("status") not in PROCESSING_FILE_STATUSES
+        and f.get("status") not in {"ready", "failed"}
+    ]
+
+    if intent_type == "file_failed_status":
+        if not failed_files:
+            return f"No files are currently failed. You have {len(ready_files)} ready and {len(processing_files)} still processing."
+        lines = [f"{len(failed_files)} file{'s' if len(failed_files) != 1 else ''} failed:", ""]
+        lines.extend(_format_file_line(i, f, include_error=True) for i, f in enumerate(failed_files[:25], 1))
+        if len(failed_files) > 25:
+            lines.append(f"\nShowing first 25 of {len(failed_files)} failed files.")
+        return "\n".join(lines)
+
+    if intent_type == "file_processing_status":
+        if not processing_files:
+            return f"No files are currently processing. You have {len(ready_files)} ready and {len(failed_files)} failed."
+        lines = [f"{len(processing_files)} file{'s are' if len(processing_files) != 1 else ' is'} still processing:", ""]
+        lines.extend(_format_file_line(i, f, include_error=False) for i, f in enumerate(processing_files[:25], 1))
+        if len(processing_files) > 25:
+            lines.append(f"\nShowing first 25 of {len(processing_files)} processing files.")
+        return "\n".join(lines)
+
+    if intent_type == "file_ready_status":
+        if not ready_files:
+            return f"No files are ready to search yet. {len(processing_files)} are processing and {len(failed_files)} failed."
+        lines = [f"{len(ready_files)} file{'s are' if len(ready_files) != 1 else ' is'} ready to search:", ""]
+        lines.extend(_format_file_line(i, f, include_error=False) for i, f in enumerate(ready_files[:25], 1))
+        if len(ready_files) > 25:
+            lines.append(f"\nShowing first 25 of {len(ready_files)} ready files.")
+        if failed_files:
+            lines.append(f"\nNote: {len(failed_files)} file{'s' if len(failed_files) != 1 else ''} failed processing.")
+        if processing_files:
+            lines.append(f"\nNote: {len(processing_files)} file{'s are' if len(processing_files) != 1 else ' is'} still processing.")
+        return "\n".join(lines)
 
     lines = [
-        f"You currently have {len(files)} file{'s' if len(files) != 1 else ''} in your library: {ready} ready, {processing} processing, {failed} failed.",
+        f"You currently have {len(files)} file{'s' if len(files) != 1 else ''} in your library: "
+        f"{len(ready_files)} ready, {len(processing_files)} processing, {len(failed_files)} failed.",
         "",
     ]
     for i, f in enumerate(files[:25], 1):
-        name = f.get("logical_name") or f.get("original_filename") or "Unnamed file"
-        status = f.get("status") or "unknown"
-        size = _format_bytes(f.get("size_bytes"))
-        err = f.get("error_message")
-        line = f"{i}. {name} — {status} — {size}"
-        if err and status == "failed":
-            line += f" — error: {str(err)[:160]}"
-        lines.append(line)
+        lines.append(_format_file_line(i, f, include_error=f.get("status") == "failed"))
 
+    if other_files:
+        lines.append(f"\n{len(other_files)} file{'s have' if len(other_files) != 1 else ' has'} another status.")
     if len(files) > 25:
         lines.append(f"\nShowing first 25 of {len(files)} files.")
     return "\n".join(lines)
@@ -906,12 +1006,16 @@ async def ask(b: AskBody, u=Depends(get_user)):
     history = _build_context(srow, recent)
     new_count = (srow.get("message_count") or 0) + 2
 
-    # Direct tool answer: file inventory questions should not go through RAG/Claude.
-    if _is_file_inventory_question(q):
+    # Direct tool answer: file/status questions should not go through RAG/Claude.
+    file_status_intent = _detect_file_status_intent(q)
+    if file_status_intent:
         files = await _load_file_inventory(cid)
-        answer = _build_file_inventory_answer(files)
+        answer = _build_file_inventory_answer(files, file_status_intent)
         return StreamingResponse(
-            _stream_direct_answer(sid, cid, uid, q, answer, new_count, history, srow, started_at),
+            _stream_direct_answer(
+                sid, cid, uid, q, answer, new_count, history, srow, started_at,
+                intent_type=file_status_intent,
+            ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"},
         )
