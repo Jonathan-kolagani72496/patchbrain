@@ -627,17 +627,27 @@ async def ask(b: AskBody, u=Depends(get_user)):
         yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
         try:
             async with ant.messages.stream(
-                async with ant.messages.stream(
-                    model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),  # always Sonnet for Q&A
+                model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
                 max_tokens=1024,
-                system=[{"type":"text","text":SYSTEM_PROMPT,
-                         "cache_control":{"type":"ephemeral"}}],
-                messages=[{"role":"user","content":user_msg}],
+                system=[
+                    {
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": user_msg,
+                    }
+                ],
             ) as stream:
                 async for text in stream.text_stream:
                     full += text
                     yield f"data: {json.dumps({'type':'token','text':text})}\n\n"
-                final_msg   = await stream.get_final_message()
+
+                final_msg = await stream.get_final_message()
                 tokens_used = final_msg.usage.input_tokens + final_msg.usage.output_tokens
         except anthropic.APIStatusError as e:
             msg = "Anthropic billing issue — add credits at console.anthropic.com" \
