@@ -1,289 +1,522 @@
+'use client'
+import { useState, useEffect, useRef } from 'react'
+import { useRouter } from 'next/navigation'
+import { supabase, getAuthHeader, API_URL } from '@/lib/supabase'
 
-Search
+type FileStatus = 'uploaded' | 'queued' | 'parsing' | 'parsed' | 'chunking' | 'embedding' | 'ready' | 'failed' | 'needs_review'
 
-May 21, 2:36 AM - 2:40 AM
-CDT
+type FileRecord = {
+  id: string
+  logical_name: string
+  created_at: string
+  file_versions: {
+    id: string
+    status: FileStatus
+    original_filename: string
+    size_bytes: number
+    created_at: string
+  }[]
+}
 
+type UploadItem = {
+  id: number           // index-based, avoids duplicate-filename collisions
+  name: string
+  status: 'waiting' | 'uploading' | 'queued' | 'failed'
+  error?: string
+}
 
+const STATUS_STYLES: Record<FileStatus, string> = {
+  uploaded:     'bg-gray-700 text-gray-300',
+  queued:       'bg-blue-500/20 text-blue-300',
+  parsing:      'bg-yellow-500/20 text-yellow-300',
+  parsed:       'bg-yellow-500/20 text-yellow-300',
+  chunking:     'bg-yellow-500/20 text-yellow-300',
+  embedding:    'bg-purple-500/20 text-purple-300',
+  ready:        'bg-green-500/20 text-green-300',
+  failed:       'bg-red-500/20 text-red-300',
+  needs_review: 'bg-orange-500/20 text-orange-300',
+}
 
-==> Downloading cache...
-==> Cloning from https://github.com/Jonathan-kolagani72496/patchbrain
-==> Checking out commit d3e55b5c0572c5e73ddda3169edca38ad125cc2e in branch main
-==> Downloaded 63MB in 2s. Extraction took 0s.
-==> Using Python version 3.11.11 via environment variable PYTHON_VERSION
-==> Docs on specifying a Python version: https://render.com/docs/python-version
-==> Installing Python version 3.11.11...
-==> Using Poetry version 2.1.3 (default)
-==> Docs on specifying a Poetry version: https://render.com/docs/poetry-version
-==> Running build command 'pip install -r requirements.txt'...
-Collecting fastapi==0.111.0 (from -r requirements.txt (line 2))
-  Using cached fastapi-0.111.0-py3-none-any.whl.metadata (25 kB)
-Collecting uvicorn==0.29.0 (from uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached uvicorn-0.29.0-py3-none-any.whl.metadata (6.3 kB)
-Collecting python-multipart==0.0.9 (from -r requirements.txt (line 4))
-  Using cached python_multipart-0.0.9-py3-none-any.whl.metadata (2.5 kB)
-Collecting supabase==2.5.0 (from -r requirements.txt (line 7))
-  Using cached supabase-2.5.0-py3-none-any.whl.metadata (9.3 kB)
-Collecting asyncpg==0.29.0 (from -r requirements.txt (line 8))
-  Using cached asyncpg-0.29.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.4 kB)
-Collecting PyMuPDF==1.24.3 (from -r requirements.txt (line 11))
-  Using cached PyMuPDF-1.24.3-cp311-none-manylinux2014_x86_64.whl.metadata (3.4 kB)
-Collecting openpyxl==3.1.2 (from -r requirements.txt (line 12))
-  Using cached openpyxl-3.1.2-py2.py3-none-any.whl.metadata (2.5 kB)
-Collecting python-docx==1.1.2 (from -r requirements.txt (line 13))
-  Using cached python_docx-1.1.2-py3-none-any.whl.metadata (2.0 kB)
-Collecting duckdb==0.10.3 (from -r requirements.txt (line 14))
-  Using cached duckdb-0.10.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (763 bytes)
-Collecting openai==1.30.0 (from -r requirements.txt (line 17))
-  Using cached openai-1.30.0-py3-none-any.whl.metadata (21 kB)
-Collecting anthropic==0.57.1 (from -r requirements.txt (line 20))
-  Using cached anthropic-0.57.1-py3-none-any.whl.metadata (27 kB)
-Collecting httpx==0.27.0 (from -r requirements.txt (line 23))
-  Using cached httpx-0.27.0-py3-none-any.whl.metadata (7.2 kB)
-Collecting python-dotenv==1.0.1 (from -r requirements.txt (line 24))
-  Using cached python_dotenv-1.0.1-py3-none-any.whl.metadata (23 kB)
-Collecting pydantic==2.7.2 (from -r requirements.txt (line 25))
-  Using cached pydantic-2.7.2-py3-none-any.whl.metadata (108 kB)
-Collecting pydantic-settings==2.3.0 (from -r requirements.txt (line 26))
-  Using cached pydantic_settings-2.3.0-py3-none-any.whl.metadata (3.3 kB)
-Collecting starlette<0.38.0,>=0.37.2 (from fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached starlette-0.37.2-py3-none-any.whl.metadata (5.9 kB)
-Collecting typing-extensions>=4.8.0 (from fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached typing_extensions-4.15.0-py3-none-any.whl.metadata (3.3 kB)
-Collecting fastapi-cli>=0.0.2 (from fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached fastapi_cli-0.0.24-py3-none-any.whl.metadata (6.4 kB)
-Collecting jinja2>=2.11.2 (from fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached jinja2-3.1.6-py3-none-any.whl.metadata (2.9 kB)
-Collecting ujson!=4.0.2,!=4.1.0,!=4.2.0,!=4.3.0,!=5.0.0,!=5.1.0,>=4.0.1 (from fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached ujson-5.12.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (9.6 kB)
-Collecting orjson>=3.2.1 (from fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached orjson-3.11.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (41 kB)
-Collecting email_validator>=2.0.0 (from fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached email_validator-2.3.0-py3-none-any.whl.metadata (26 kB)
-Collecting click>=7.0 (from uvicorn==0.29.0->uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached click-8.4.0-py3-none-any.whl.metadata (2.6 kB)
-Collecting h11>=0.8 (from uvicorn==0.29.0->uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached h11-0.16.0-py3-none-any.whl.metadata (8.3 kB)
-Collecting gotrue<3.0,>=1.3 (from supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached gotrue-2.12.4-py3-none-any.whl.metadata (2.0 kB)
-Collecting postgrest<0.17.0,>=0.14 (from supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached postgrest-0.16.11-py3-none-any.whl.metadata (5.1 kB)
-Collecting realtime<2.0.0,>=1.0.0 (from supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached realtime-1.0.6-py3-none-any.whl.metadata (2.6 kB)
-Collecting storage3<0.8.0,>=0.5.3 (from supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached storage3-0.7.7-py3-none-any.whl.metadata (1.9 kB)
-Collecting supafunc<0.5.0,>=0.3.1 (from supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached supafunc-0.4.7-py3-none-any.whl.metadata (1.2 kB)
-Collecting async-timeout>=4.0.3 (from asyncpg==0.29.0->-r requirements.txt (line 8))
-  Using cached async_timeout-5.0.1-py3-none-any.whl.metadata (5.1 kB)
-Collecting PyMuPDFb==1.24.3 (from PyMuPDF==1.24.3->-r requirements.txt (line 11))
-  Using cached PyMuPDFb-1.24.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl.metadata (1.4 kB)
-Collecting et-xmlfile (from openpyxl==3.1.2->-r requirements.txt (line 12))
-  Using cached et_xmlfile-2.0.0-py3-none-any.whl.metadata (2.7 kB)
-Collecting lxml>=3.1.0 (from python-docx==1.1.2->-r requirements.txt (line 13))
-  Using cached lxml-6.1.1-cp311-cp311-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl.metadata (3.5 kB)
-Collecting anyio<5,>=3.5.0 (from openai==1.30.0->-r requirements.txt (line 17))
-  Using cached anyio-4.13.0-py3-none-any.whl.metadata (4.5 kB)
-Collecting distro<2,>=1.7.0 (from openai==1.30.0->-r requirements.txt (line 17))
-  Using cached distro-1.9.0-py3-none-any.whl.metadata (6.8 kB)
-Collecting sniffio (from openai==1.30.0->-r requirements.txt (line 17))
-  Using cached sniffio-1.3.1-py3-none-any.whl.metadata (3.9 kB)
-Collecting tqdm>4 (from openai==1.30.0->-r requirements.txt (line 17))
-  Using cached tqdm-4.67.3-py3-none-any.whl.metadata (57 kB)
-Collecting jiter<1,>=0.4.0 (from anthropic==0.57.1->-r requirements.txt (line 20))
-  Using cached jiter-0.15.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (5.2 kB)
-Collecting certifi (from httpx==0.27.0->-r requirements.txt (line 23))
-  Using cached certifi-2026.5.20-py3-none-any.whl.metadata (2.5 kB)
-Collecting httpcore==1.* (from httpx==0.27.0->-r requirements.txt (line 23))
-  Using cached httpcore-1.0.9-py3-none-any.whl.metadata (21 kB)
-Collecting idna (from httpx==0.27.0->-r requirements.txt (line 23))
-  Using cached idna-3.15-py3-none-any.whl.metadata (7.7 kB)
-Collecting annotated-types>=0.4.0 (from pydantic==2.7.2->-r requirements.txt (line 25))
-  Using cached annotated_types-0.7.0-py3-none-any.whl.metadata (15 kB)
-Collecting pydantic-core==2.18.3 (from pydantic==2.7.2->-r requirements.txt (line 25))
-  Using cached pydantic_core-2.18.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.5 kB)
-Collecting httptools>=0.5.0 (from uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached httptools-0.7.1-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl.metadata (3.5 kB)
-Collecting pyyaml>=5.1 (from uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.4 kB)
-Collecting uvloop!=0.15.0,!=0.15.1,>=0.14.0 (from uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached uvloop-0.22.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (4.9 kB)
-Collecting watchfiles>=0.13 (from uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached watchfiles-1.2.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (4.9 kB)
-Collecting websockets>=10.4 (from uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached websockets-16.0-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl.metadata (6.8 kB)
-Collecting dnspython>=2.0.0 (from email_validator>=2.0.0->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached dnspython-2.8.0-py3-none-any.whl.metadata (5.7 kB)
-Collecting typer>=0.16.0 (from fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached typer-0.25.1-py3-none-any.whl.metadata (15 kB)
-Collecting rich-toolkit>=0.14.8 (from fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached rich_toolkit-0.19.9-py3-none-any.whl.metadata (1.0 kB)
-Collecting pyjwt<3.0.0,>=2.10.1 (from gotrue<3.0,>=1.3->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached pyjwt-2.12.1-py3-none-any.whl.metadata (4.1 kB)
-Collecting MarkupSafe>=2.0 (from jinja2>=2.11.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached markupsafe-3.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (2.7 kB)
-Collecting deprecation<3.0.0,>=2.1.0 (from postgrest<0.17.0,>=0.14->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached deprecation-2.1.0-py2.py3-none-any.whl.metadata (4.6 kB)
-Collecting strenum<0.5.0,>=0.4.9 (from postgrest<0.17.0,>=0.14->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached StrEnum-0.4.15-py3-none-any.whl.metadata (5.3 kB)
-Collecting python-dateutil<3.0.0,>=2.8.1 (from realtime<2.0.0,>=1.0.0->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl.metadata (8.4 kB)
-Collecting websockets>=10.4 (from uvicorn[standard]==0.29.0->-r requirements.txt (line 3))
-  Using cached websockets-12.0-cp311-cp311-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.6 kB)
-Collecting packaging (from deprecation<3.0.0,>=2.1.0->postgrest<0.17.0,>=0.14->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached packaging-26.2-py3-none-any.whl.metadata (3.5 kB)
-Collecting h2<5,>=3 (from httpx[http2]<0.29,>=0.26->gotrue<3.0,>=1.3->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached h2-4.3.0-py3-none-any.whl.metadata (5.1 kB)
-Collecting six>=1.5 (from python-dateutil<3.0.0,>=2.8.1->realtime<2.0.0,>=1.0.0->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached six-1.17.0-py2.py3-none-any.whl.metadata (1.7 kB)
-Collecting rich>=13.7.1 (from rich-toolkit>=0.14.8->fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached rich-15.0.0-py3-none-any.whl.metadata (18 kB)
-Collecting shellingham>=1.3.0 (from typer>=0.16.0->fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached shellingham-1.5.4-py2.py3-none-any.whl.metadata (3.5 kB)
-Collecting annotated-doc>=0.0.2 (from typer>=0.16.0->fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached annotated_doc-0.0.4-py3-none-any.whl.metadata (6.6 kB)
-Collecting hyperframe<7,>=6.1 (from h2<5,>=3->httpx[http2]<0.29,>=0.26->gotrue<3.0,>=1.3->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached hyperframe-6.1.0-py3-none-any.whl.metadata (4.3 kB)
-Collecting hpack<5,>=4.1 (from h2<5,>=3->httpx[http2]<0.29,>=0.26->gotrue<3.0,>=1.3->supabase==2.5.0->-r requirements.txt (line 7))
-  Using cached hpack-4.1.0-py3-none-any.whl.metadata (4.6 kB)
-Collecting markdown-it-py>=2.2.0 (from rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached markdown_it_py-4.2.0-py3-none-any.whl.metadata (7.4 kB)
-Collecting pygments<3.0.0,>=2.13.0 (from rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached pygments-2.20.0-py3-none-any.whl.metadata (2.5 kB)
-Collecting mdurl~=0.1 (from markdown-it-py>=2.2.0->rich>=13.7.1->rich-toolkit>=0.14.8->fastapi-cli>=0.0.2->fastapi==0.111.0->-r requirements.txt (line 2))
-  Using cached mdurl-0.1.2-py3-none-any.whl.metadata (1.6 kB)
-Using cached fastapi-0.111.0-py3-none-any.whl (91 kB)
-Using cached uvicorn-0.29.0-py3-none-any.whl (60 kB)
-Using cached python_multipart-0.0.9-py3-none-any.whl (22 kB)
-Using cached supabase-2.5.0-py3-none-any.whl (16 kB)
-Using cached asyncpg-0.29.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (2.8 MB)
-Using cached PyMuPDF-1.24.3-cp311-none-manylinux2014_x86_64.whl (3.5 MB)
-Using cached openpyxl-3.1.2-py2.py3-none-any.whl (249 kB)
-Using cached python_docx-1.1.2-py3-none-any.whl (244 kB)
-Using cached duckdb-0.10.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (18.5 MB)
-Using cached openai-1.30.0-py3-none-any.whl (320 kB)
-Using cached anthropic-0.57.1-py3-none-any.whl (292 kB)
-Using cached httpx-0.27.0-py3-none-any.whl (75 kB)
-Using cached python_dotenv-1.0.1-py3-none-any.whl (19 kB)
-Using cached pydantic-2.7.2-py3-none-any.whl (409 kB)
-Using cached pydantic_settings-2.3.0-py3-none-any.whl (21 kB)
-Using cached httpcore-1.0.9-py3-none-any.whl (78 kB)
-Using cached pydantic_core-2.18.3-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (2.0 MB)
-Using cached PyMuPDFb-1.24.3-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (15.8 MB)
-Using cached annotated_types-0.7.0-py3-none-any.whl (13 kB)
-Using cached anyio-4.13.0-py3-none-any.whl (114 kB)
-Using cached async_timeout-5.0.1-py3-none-any.whl (6.2 kB)
-Using cached click-8.4.0-py3-none-any.whl (116 kB)
-Using cached distro-1.9.0-py3-none-any.whl (20 kB)
-Using cached email_validator-2.3.0-py3-none-any.whl (35 kB)
-Using cached fastapi_cli-0.0.24-py3-none-any.whl (12 kB)
-Using cached gotrue-2.12.4-py3-none-any.whl (42 kB)
-Using cached h11-0.16.0-py3-none-any.whl (37 kB)
-Using cached httptools-0.7.1-cp311-cp311-manylinux1_x86_64.manylinux_2_28_x86_64.manylinux_2_5_x86_64.whl (456 kB)
-Using cached idna-3.15-py3-none-any.whl (72 kB)
-Using cached jinja2-3.1.6-py3-none-any.whl (134 kB)
-Using cached jiter-0.15.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (349 kB)
-Using cached lxml-6.1.1-cp311-cp311-manylinux_2_26_x86_64.manylinux_2_28_x86_64.whl (5.2 MB)
-Using cached orjson-3.11.9-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (133 kB)
-Using cached postgrest-0.16.11-py3-none-any.whl (21 kB)
-Using cached pyyaml-6.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (806 kB)
-Using cached realtime-1.0.6-py3-none-any.whl (9.0 kB)
-Using cached starlette-0.37.2-py3-none-any.whl (71 kB)
-Using cached storage3-0.7.7-py3-none-any.whl (16 kB)
-Using cached supafunc-0.4.7-py3-none-any.whl (6.2 kB)
-Using cached tqdm-4.67.3-py3-none-any.whl (78 kB)
-Using cached typing_extensions-4.15.0-py3-none-any.whl (44 kB)
-Using cached ujson-5.12.1-cp311-cp311-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (59 kB)
-Using cached uvloop-0.22.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (3.8 MB)
-Using cached watchfiles-1.2.0-cp311-cp311-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (456 kB)
-Using cached websockets-12.0-cp311-cp311-manylinux_2_5_x86_64.manylinux1_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl (130 kB)
-Using cached certifi-2026.5.20-py3-none-any.whl (134 kB)
-Using cached et_xmlfile-2.0.0-py3-none-any.whl (18 kB)
-Using cached sniffio-1.3.1-py3-none-any.whl (10 kB)
-Using cached deprecation-2.1.0-py2.py3-none-any.whl (11 kB)
-Using cached dnspython-2.8.0-py3-none-any.whl (331 kB)
-Using cached markupsafe-3.0.3-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (22 kB)
-Using cached pyjwt-2.12.1-py3-none-any.whl (29 kB)
-Using cached python_dateutil-2.9.0.post0-py2.py3-none-any.whl (229 kB)
-Using cached rich_toolkit-0.19.9-py3-none-any.whl (33 kB)
-Using cached StrEnum-0.4.15-py3-none-any.whl (8.9 kB)
-Using cached typer-0.25.1-py3-none-any.whl (58 kB)
-Using cached annotated_doc-0.0.4-py3-none-any.whl (5.3 kB)
-Using cached h2-4.3.0-py3-none-any.whl (61 kB)
-Using cached rich-15.0.0-py3-none-any.whl (310 kB)
-Using cached shellingham-1.5.4-py2.py3-none-any.whl (9.8 kB)
-Using cached six-1.17.0-py2.py3-none-any.whl (11 kB)
-Using cached packaging-26.2-py3-none-any.whl (100 kB)
-Using cached hpack-4.1.0-py3-none-any.whl (34 kB)
-Using cached hyperframe-6.1.0-py3-none-any.whl (13 kB)
-Using cached markdown_it_py-4.2.0-py3-none-any.whl (91 kB)
-Using cached pygments-2.20.0-py3-none-any.whl (1.2 MB)
-Using cached mdurl-0.1.2-py3-none-any.whl (10.0 kB)
-Installing collected packages: strenum, websockets, uvloop, ujson, typing-extensions, tqdm, sniffio, six, shellingham, pyyaml, python-multipart, python-dotenv, PyMuPDFb, pyjwt, pygments, packaging, orjson, mdurl, MarkupSafe, lxml, jiter, idna, hyperframe, httptools, hpack, h11, et-xmlfile, duckdb, dnspython, distro, click, certifi, async-timeout, annotated-types, annotated-doc, uvicorn, python-docx, python-dateutil, PyMuPDF, pydantic-core, openpyxl, markdown-it-py, jinja2, httpcore, h2, email_validator, deprecation, asyncpg, anyio, watchfiles, starlette, rich, realtime, pydantic, httpx, typer, rich-toolkit, pydantic-settings, openai, anthropic, supafunc, storage3, postgrest, gotrue, fastapi-cli, supabase, fastapi
-Successfully installed MarkupSafe-3.0.3 PyMuPDF-1.24.3 PyMuPDFb-1.24.3 annotated-doc-0.0.4 annotated-types-0.7.0 anthropic-0.57.1 anyio-4.13.0 async-timeout-5.0.1 asyncpg-0.29.0 certifi-2026.5.20 click-8.4.0 deprecation-2.1.0 distro-1.9.0 dnspython-2.8.0 duckdb-0.10.3 email_validator-2.3.0 et-xmlfile-2.0.0 fastapi-0.111.0 fastapi-cli-0.0.24 gotrue-2.12.4 h11-0.16.0 h2-4.3.0 hpack-4.1.0 httpcore-1.0.9 httptools-0.7.1 httpx-0.27.0 hyperframe-6.1.0 idna-3.15 jinja2-3.1.6 jiter-0.15.0 lxml-6.1.1 markdown-it-py-4.2.0 mdurl-0.1.2 openai-1.30.0 openpyxl-3.1.2 orjson-3.11.9 packaging-26.2 postgrest-0.16.11 pydantic-2.7.2 pydantic-core-2.18.3 pydantic-settings-2.3.0 pygments-2.20.0 pyjwt-2.12.1 python-dateutil-2.9.0.post0 python-docx-1.1.2 python-dotenv-1.0.1 python-multipart-0.0.9 pyyaml-6.0.3 realtime-1.0.6 rich-15.0.0 rich-toolkit-0.19.9 shellingham-1.5.4 six-1.17.0 sniffio-1.3.1 starlette-0.37.2 storage3-0.7.7 strenum-0.4.15 supabase-2.5.0 supafunc-0.4.7 tqdm-4.67.3 typer-0.25.1 typing-extensions-4.15.0 ujson-5.12.1 uvicorn-0.29.0 uvloop-0.22.1 watchfiles-1.2.0 websockets-12.0
-[notice] A new release of pip is available: 24.0 -> 26.1.1
-[notice] To update, run: pip install --upgrade pip
-==> Uploading build...
-==> Uploaded in 3.3s. Compression took 2.3s
-==> Build successful 🎉
-==> Deploying...
-==> Setting WEB_CONCURRENCY=1 by default, based on available CPUs in the instance
-==> Running 'uvicorn main:app --host 0.0.0.0 --port $PORT'
-Traceback (most recent call last):
-  File "/opt/render/project/src/.venv/bin/uvicorn", line 8, in <module>
-    sys.exit(main())
-             ^^^^^^
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/click/core.py", line 1524, in __call__
-    return self.main(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/click/core.py", line 1445, in main
-    rv = self.invoke(ctx)
-         ^^^^^^^^^^^^^^^^
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/click/core.py", line 1308, in invoke
-    return ctx.invoke(self.callback, **ctx.params)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/click/core.py", line 877, in invoke
-    return callback(*args, **kwargs)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/uvicorn/main.py", line 409, in main
-    run(
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/uvicorn/main.py", line 575, in run
-    server.run()
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/uvicorn/server.py", line 65, in run
-    return asyncio.run(self.serve(sockets=sockets))
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/render/project/python/Python-3.11.11/lib/python3.11/asyncio/runners.py", line 190, in run
-    return runner.run(main)
-           ^^^^^^^^^^^^^^^^
-  File "/opt/render/project/python/Python-3.11.11/lib/python3.11/asyncio/runners.py", line 118, in run
-    return self._loop.run_until_complete(task)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "uvloop/loop.pyx", line 1518, in uvloop.loop.Loop.run_until_complete
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/uvicorn/server.py", line 69, in serve
-    await self._serve(sockets)
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/uvicorn/server.py", line 76, in _serve
-    config.load()
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/uvicorn/config.py", line 433, in load
-    self.loaded_app = import_from_string(self.app)
-                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/render/project/src/.venv/lib/python3.11/site-packages/uvicorn/importer.py", line 19, in import_from_string
-    module = importlib.import_module(module_str)
-             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/opt/render/project/python/Python-3.11.11/lib/python3.11/importlib/__init__.py", line 126, in import_module
-    return _bootstrap._gcd_import(name[level:], package, level)
-           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "<frozen importlib._bootstrap>", line 1204, in _gcd_import
-  File "<frozen importlib._bootstrap>", line 1176, in _find_and_load
-  File "<frozen importlib._bootstrap>", line 1147, in _find_and_load_unlocked
-  File "<frozen importlib._bootstrap>", line 690, in _load_unlocked
-  File "<frozen importlib._bootstrap_external>", line 936, in exec_module
-  File "<frozen importlib._bootstrap_external>", line 1074, in get_code
-  File "<frozen importlib._bootstrap_external>", line 1004, in source_to_code
-  File "<frozen importlib._bootstrap>", line 241, in _call_with_frames_removed
-  File "/opt/render/project/src/backend/main.py", line 629
-    async with ant.messages.stream(
-                                  ^
-SyntaxError: '(' was never closed
-==> Exited with status 1
-==> Common ways to troubleshoot your deploy: https://render.com/docs/troubleshooting-deploys
-==> Running 'uvicorn main:app --host 0.0.0.0 --port $PORT'
+const STATUS_LABELS: Record<FileStatus, string> = {
+  uploaded:     'Uploaded',
+  queued:       'Queued',
+  parsing:      'Reading file…',
+  parsed:       'Parsed',
+  chunking:     'Preparing…',
+  embedding:    'Indexing…',
+  ready:        'Ready',
+  failed:       'Failed',
+  needs_review: 'Needs review',
+}
+
+function formatBytes(bytes: number) {
+  if (!bytes) return '—'
+  if (bytes < 1024) return `${bytes} B`
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+export default function DashboardPage() {
+  const router = useRouter()
+  const [files, setFiles] = useState<FileRecord[]>([])
+  const [loading, setLoading] = useState(true)
+  const [uploadQueue, setUploadQueue] = useState<UploadItem[]>([])
+  const [isDragging, setIsDragging] = useState(false)
+  const [uploadError, setUploadError] = useState('')
+  const [selectedIds, setSelectedIds] = useState<string[]>([])
+  const [deleting, setDeleting] = useState(false)
+  const [downloading, setDownloading] = useState(false)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
+  const isUploading = uploadQueue.some(q => q.status === 'waiting' || q.status === 'uploading')
+
+  useEffect(() => {
+    checkAuth()
+    loadFiles()
+    const interval = setInterval(loadFiles, 5000)
+    return () => clearInterval(interval)
+  }, [])
+
+  async function checkAuth() {
+    const { data } = await supabase.auth.getSession()
+    if (!data.session) router.push('/login')
+  }
+
+  async function loadFiles() {
+    try {
+      const headers = await getAuthHeader()
+      const res = await fetch(`${API_URL}/files`, { headers })
+      if (res.status === 401) { router.push('/login'); return }
+      const data = await res.json()
+      setFiles(data || [])
+    } catch (err) {
+      console.error('Failed to load files', err)
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  async function uploadOneFile(file: File, headers: Record<string, string>): Promise<void> {
+    const requestRes = await fetch(`${API_URL}/upload/request`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        filename: file.name,
+        mime_type: file.type || 'application/octet-stream',
+        size_bytes: file.size,
+      }),
+    })
+
+    const requestData = await requestRes.json()
+    if (!requestRes.ok) throw new Error(requestData.detail || 'Failed to request upload URL')
+
+    // Must use supabase client — raw fetch PUT to Supabase signed upload URLs doesn't work
+    const { error: storageError } = await supabase.storage
+      .from('company-files')
+      .uploadToSignedUrl(requestData.storage_path, requestData.upload_token, file)
+
+    if (storageError) throw new Error(storageError.message || 'Failed to upload to storage')
+
+    const confirmRes = await fetch(`${API_URL}/upload/confirm`, {
+      method: 'POST',
+      headers: { ...headers, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_version_id: requestData.file_version_id }),
+    })
+
+    const confirmData = await confirmRes.json()
+    if (!confirmRes.ok) throw new Error(confirmData.detail || 'Failed to queue file')
+  }
+
+  async function handleFilesUpload(rawFiles: File[]) {
+    if (!rawFiles.length) return
+
+    if (rawFiles.length > 20) {
+      setUploadError('Max 20 files at a time.')
+      return
+    }
+
+    setUploadError('')
+
+    // Fetch auth once for the whole batch — avoids per-file session lookups
+    // that can blip and falsely mark a file as failed after storage accepted it
+    let headers: Record<string, string>
+    try {
+      headers = await getAuthHeader()
+    } catch (err: any) {
+      setUploadError(err.message || 'Not authenticated')
+      return
+    }
+
+    // Build queue using index as stable ID — avoids same-filename collision
+    const queue: UploadItem[] = rawFiles.map((f, i) => ({
+      id: i,
+      name: f.name,
+      status: 'waiting',
+    }))
+    setUploadQueue(queue)
+
+    for (let i = 0; i < rawFiles.length; i++) {
+      setUploadQueue(prev =>
+        prev.map(item => item.id === i ? { ...item, status: 'uploading' } : item)
+      )
+
+      try {
+        await uploadOneFile(rawFiles[i], headers)
+        setUploadQueue(prev =>
+          prev.map(item => item.id === i ? { ...item, status: 'queued' } : item)
+        )
+      } catch (err: any) {
+        setUploadQueue(prev =>
+          prev.map(item =>
+            item.id === i
+              ? { ...item, status: 'failed', error: err.message || 'Upload failed' }
+              : item
+          )
+        )
+      }
+    }
+
+    await loadFiles()
+    // Clear queue after a short delay so user can see all-green before it disappears
+    setTimeout(() => setUploadQueue([]), 3000)
+    if (fileInputRef.current) fileInputRef.current.value = ''
+  }
+
+  async function handleSignOut() {
+    await supabase.auth.signOut()
+    router.push('/login')
+  }
+
+  // ── Selection helpers ──────────────────────────────────────────────────────
+
+  const selectedCount = selectedIds.length
+  const allSelected = files.length > 0 && selectedIds.length === files.length
+
+  function toggleFileSelected(fileId: string) {
+    setSelectedIds(prev =>
+      prev.includes(fileId)
+        ? prev.filter(id => id !== fileId)
+        : [...prev, fileId]
+    )
+  }
+
+  function toggleAllSelected() {
+    setSelectedIds(allSelected ? [] : files.map(f => f.id))
+  }
+
+  // ── Core delete/download by explicit ID list ───────────────────────────────
+  // These take an explicit id list so hover-row buttons don't race with state.
+
+  async function deleteFileIds(ids: string[]) {
+    if (ids.length === 0) return
+
+    const ok = window.confirm(
+      `Delete ${ids.length} file(s)? This permanently removes the file, chunks, jobs, and storage object.`
+    )
+    if (!ok) return
+
+    setDeleting(true)
+    setUploadError('')
+
+    try {
+      const headers = await getAuthHeader()
+      const res = await fetch(`${API_URL}/files/delete`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_ids: ids }),
+      })
+
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.detail || 'Failed to delete files')
+
+      setSelectedIds(prev => prev.filter(id => !ids.includes(id)))
+      await loadFiles()
+    } catch (err: any) {
+      setUploadError(err.message || 'Delete failed')
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  async function downloadFileIds(ids: string[]) {
+    if (ids.length === 0) return
+
+    setDownloading(true)
+    setUploadError('')
+
+    try {
+      const headers = await getAuthHeader()
+      const res = await fetch(`${API_URL}/files/download-url`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ file_ids: ids }),
+      })
+
+      const data = await res.json().catch(() => ({}))
+      if (!res.ok) throw new Error(data.detail || 'Failed to get download URL')
+
+      for (const item of data.files || []) {
+        if (!item.url) continue
+        const a = document.createElement('a')
+        a.href = item.url
+        a.download = item.filename || 'download'
+        a.target = '_blank'
+        document.body.appendChild(a)
+        a.click()
+        a.remove()
+      }
+    } catch (err: any) {
+      setUploadError(err.message || 'Download failed')
+    } finally {
+      setDownloading(false)
+    }
+  }
+
+  // Bulk wrappers that use current selectedIds
+  const handleDeleteSelected  = () => deleteFileIds(selectedIds)
+  const handleDownloadSelected = () => downloadFileIds(selectedIds)
+
+  const currentVersion = (f: FileRecord) => f.file_versions?.[0]
+
+  return (
+    <div className="min-h-screen bg-gray-950 text-white">
+
+      {/* Header */}
+      <header className="border-b border-gray-800 px-6 py-4 flex items-center justify-between">
+        <div className="flex items-center gap-3">
+          <div className="w-8 h-8 bg-orange-500 rounded-lg flex items-center justify-center">
+            <span className="text-white font-bold text-sm">P</span>
+          </div>
+          <span className="font-semibold text-white">PatchBrain</span>
+        </div>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={() => router.push('/chat')}
+            className="bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium px-4 py-2 rounded-lg transition-colors"
+          >
+            Open Chat →
+          </button>
+          <button
+            onClick={handleSignOut}
+            className="text-gray-400 hover:text-gray-300 text-sm transition-colors"
+          >
+            Sign out
+          </button>
+        </div>
+      </header>
+
+      <main className="max-w-4xl mx-auto px-6 py-8">
+
+        {/* Upload section */}
+        <div className="mb-8">
+          <div className="flex items-center justify-between mb-4">
+            <div>
+              <h1 className="text-xl font-semibold">File Library</h1>
+              <p className="text-gray-400 text-sm mt-0.5">Upload field tickets, invoices, reports, and spreadsheets</p>
+            </div>
+          </div>
+
+          {/* Drag-and-drop zone */}
+          <div
+            onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
+            onDragLeave={() => setIsDragging(false)}
+            onDrop={(e) => {
+              e.preventDefault()
+              setIsDragging(false)
+              const dropped = Array.from(e.dataTransfer.files || [])
+              if (dropped.length) handleFilesUpload(dropped)
+            }}
+            onClick={() => !isUploading && fileInputRef.current?.click()}
+            className={`relative border-2 border-dashed rounded-xl px-6 py-8 text-center transition-colors cursor-pointer
+              ${isDragging
+                ? 'border-orange-500 bg-orange-500/10'
+                : isUploading
+                  ? 'border-gray-700 bg-gray-900/50 cursor-not-allowed'
+                  : 'border-gray-700 bg-gray-900 hover:border-gray-600 hover:bg-gray-900/80'
+              }`}
+          >
+            <input
+              ref={fileInputRef}
+              type="file"
+              multiple
+              accept=".pdf,.xlsx,.xls,.docx,.txt,.csv"
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files) handleFilesUpload(Array.from(e.target.files))
+              }}
+            />
+
+            {isUploading ? (
+              <div className="flex items-center justify-center gap-2 text-gray-400 text-sm">
+                <span className="w-4 h-4 border-2 border-gray-500 border-t-orange-400 rounded-full animate-spin" />
+                Uploading files…
+              </div>
+            ) : (
+              <>
+                <p className="text-gray-300 text-sm font-medium">
+                  Drag files here or <span className="text-orange-400">click to upload</span>
+                </p>
+                <p className="text-gray-600 text-xs mt-1">PDF, Excel, Word, CSV, TXT · up to 20 files at once</p>
+              </>
+            )}
+          </div>
+
+          {/* Per-file upload queue */}
+          {uploadQueue.length > 0 && (
+            <div className="mt-3 space-y-1.5">
+              {uploadQueue.map((item) => (
+                <div
+                  key={item.id}
+                  className="flex items-center justify-between rounded-lg border border-gray-800 bg-gray-900 px-4 py-2 text-sm"
+                >
+                  <span className="text-gray-300 truncate max-w-xs">{item.name}</span>
+                  <span className={
+                    item.status === 'queued'    ? 'text-green-400 ml-4 shrink-0' :
+                    item.status === 'failed'    ? 'text-red-400 ml-4 shrink-0' :
+                    item.status === 'uploading' ? 'text-orange-400 ml-4 shrink-0' :
+                                                  'text-gray-500 ml-4 shrink-0'
+                  }>
+                    {item.status === 'failed' && item.error ? item.error : item.status}
+                  </span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {uploadError && (
+            <div className="text-sm text-red-400 bg-red-400/10 border border-red-400/20 rounded-lg px-4 py-3 mt-3">
+              {uploadError}
+            </div>
+          )}
+        </div>
+
+        {/* File list */}
+        <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
+          {loading ? (
+            <div className="px-6 py-12 text-center text-gray-500 text-sm">Loading files…</div>
+          ) : files.length === 0 ? (
+            <div className="px-6 py-12 text-center">
+              <p className="text-gray-400 text-sm">No files uploaded yet.</p>
+              <p className="text-gray-600 text-xs mt-1">Upload a PDF or Excel file to get started.</p>
+            </div>
+          ) : (
+            // FIX 1: wrap in a fragment <> so JSX is valid
+            <>
+              {/* Bulk action bar — only shows when something is selected */}
+              {selectedCount > 0 && (
+                <div className="flex items-center justify-between px-6 py-3 border-b border-gray-800 bg-gray-900/80">
+                  <span className="text-sm text-gray-400">{selectedCount} selected</span>
+                  <div className="flex items-center gap-2">
+                    <button
+                      onClick={handleDownloadSelected}
+                      disabled={downloading}
+                      className="text-xs px-3 py-1.5 rounded-lg border border-gray-700 text-gray-300 hover:text-white hover:border-gray-600 disabled:opacity-50"
+                    >
+                      {downloading ? 'Downloading…' : 'Download'}
+                    </button>
+                    <button
+                      onClick={handleDeleteSelected}
+                      disabled={deleting}
+                      className="text-xs px-3 py-1.5 rounded-lg border border-red-500/40 text-red-300 hover:bg-red-500/10 disabled:opacity-50"
+                    >
+                      {deleting ? 'Deleting…' : 'Delete'}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <table className="w-full">
+                <thead>
+                  <tr className="border-b border-gray-800">
+                    <th className="px-6 py-3 w-10">
+                      <input
+                        type="checkbox"
+                        checked={allSelected}
+                        onChange={toggleAllSelected}
+                        className="accent-orange-500"
+                      />
+                    </th>
+                    <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium">File</th>
+                    <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium">Size</th>
+                    <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium">Status</th>
+                    <th className="text-left px-6 py-3 text-gray-500 text-xs font-medium">Uploaded</th>
+                    {/* FIX 2: Actions column is last, not second */}
+                    <th className="text-right px-6 py-3 text-gray-500 text-xs font-medium">Actions</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {files.map((file, i) => {
+                    const v = currentVersion(file)
+                    const status = v?.status as FileStatus || 'uploaded'
+                    return (
+                      <tr
+                        key={file.id}
+                        className={`${i < files.length - 1 ? 'border-b border-gray-800' : ''} group hover:bg-gray-800/50 transition-colors`}
+                      >
+                        {/* Checkbox */}
+                        <td className="px-6 py-4">
+                          <input
+                            type="checkbox"
+                            checked={selectedIds.includes(file.id)}
+                            onChange={() => toggleFileSelected(file.id)}
+                            className="accent-orange-500"
+                          />
+                        </td>
+
+                        {/* File name */}
+                        <td className="px-6 py-4">
+                          <span className="text-white text-sm font-medium">{file.logical_name}</span>
+                        </td>
+
+                        {/* Size */}
+                        <td className="px-6 py-4 text-gray-400 text-sm">
+                          {formatBytes(v?.size_bytes || 0)}
+                        </td>
+
+                        {/* Status */}
+                        <td className="px-6 py-4">
+                          <span className={`inline-flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-full ${STATUS_STYLES[status]}`}>
+                            {['queued','parsing','parsed','chunking','embedding'].includes(status) && (
+                              <span className="w-1.5 h-1.5 rounded-full bg-current animate-pulse" />
+                            )}
+                            {STATUS_LABELS[status]}
+                          </span>
+                        </td>
+
+                        {/* Uploaded date */}
+                        <td className="px-6 py-4 text-gray-500 text-sm">
+                          {new Date(file.created_at).toLocaleDateString()}
+                        </td>
+
+                        {/* FIX 3: Actions — pass ID directly, no state race */}
+                        <td className="px-6 py-4 text-right">
+                          <div className="opacity-0 group-hover:opacity-100 transition-opacity flex items-center justify-end gap-2">
+                            <button
+                              onClick={() => downloadFileIds([file.id])}
+                              disabled={downloading}
+                              className="text-xs text-gray-400 hover:text-white disabled:opacity-30"
+                            >
+                              Download
+                            </button>
+                            <button
+                              onClick={() => deleteFileIds([file.id])}
+                              disabled={deleting}
+                              className="text-xs text-red-400 hover:text-red-300 disabled:opacity-30"
+                            >
+                              Delete
+                            </button>
+                          </div>
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+            </>
+          )}
+        </div>
+
+      </main>
+    </div>
+  )
+}
