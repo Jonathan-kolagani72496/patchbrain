@@ -4,7 +4,7 @@ Run with: python worker.py
 
 This script runs forever, claiming and processing ingestion jobs.
 It downloads each file from Supabase Storage, parses it, chunks it,
-embeds it, and writes chunks back to the database.
+optionally contextualizes chunks, embeds them, and writes chunks back to the database.
 
 Conflict detection is intentionally disabled in this worker version.
 """
@@ -22,6 +22,7 @@ from typing import Any
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import OpenAI
+import anthropic
 
 # Parsers
 from parsers.pdf_parser import parse_pdf
@@ -35,6 +36,16 @@ WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
 POLL_INTERVAL = int(os.environ.get("WORKER_POLL_INTERVAL", 5))
 MAX_RETRIES = int(os.environ.get("WORKER_MAX_RETRIES", 3))
 EMBED_BATCH_SIZE = int(os.environ.get("EMBED_BATCH_SIZE", 100))
+
+# Contextual retrieval controls.
+# Keep disabled unless explicitly enabled so deploys do not unexpectedly increase Anthropic spend.
+ENABLE_CONTEXTUAL_RETRIEVAL = os.environ.get("ENABLE_CONTEXTUAL_RETRIEVAL", "false").lower() in {"1", "true", "yes", "on"}
+CONTEXTUALIZATION_MODEL = os.environ.get("CONTEXTUALIZATION_MODEL", "claude-haiku-4-5-20251001")
+CONTEXTUALIZATION_MAX_CHUNKS = int(os.environ.get("CONTEXTUALIZATION_MAX_CHUNKS", 120))
+CONTEXTUALIZATION_DOC_SAMPLE_CHARS = int(os.environ.get("CONTEXTUALIZATION_DOC_SAMPLE_CHARS", 12000))
+CONTEXTUALIZATION_CHUNK_CHARS = int(os.environ.get("CONTEXTUALIZATION_CHUNK_CHARS", 2400))
+CONTEXTUALIZATION_MAX_TOKENS = int(os.environ.get("CONTEXTUALIZATION_MAX_TOKENS", 90))
+CONTEXTUALIZATION_SLEEP_MS = int(os.environ.get("CONTEXTUALIZATION_SLEEP_MS", 0))
 
 WHATSAPP_LINE_RE = re.compile(
     r"^(?:"
@@ -54,6 +65,7 @@ def get_supabase() -> Client:
 
 
 openai_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+anthropic_client = anthropic.Anthropic(api_key=os.environ.get("ANTHROPIC_API_KEY")) if os.environ.get("ANTHROPIC_API_KEY") else None
 
 
 def claim_next_job(sb: Client) -> dict | None:
@@ -91,6 +103,199 @@ def embed_chunks(texts: list[str]) -> list[list[float]]:
         all_embeddings.extend([item.embedding for item in response.data])
 
     return all_embeddings
+
+
+
+def _truncate(text: str, limit: int) -> str:
+    text = " ".join((text or "").split())
+    if len(text) <= limit:
+        return text
+    return text[:limit].rsplit(" ", 1)[0] + "…"
+
+
+def build_document_context(chunks: list[dict], original_filename: str, mime_type: str) -> str:
+    """Build a compact document-level context string for chunk contextualization.
+
+    This is intentionally deterministic and cheap. Claude sees this plus one chunk
+    and writes a short retrieval-oriented summary. We do not store this as source text.
+    """
+    source_types = sorted({str(c.get("source_type") or "unknown") for c in chunks})
+    sheets = sorted({str(c.get("sheet_name")) for c in chunks if c.get("sheet_name")})
+    pages = [c.get("page_number") for c in chunks if c.get("page_number") is not None]
+
+    metadata_lines = [
+        f"Filename: {original_filename}",
+        f"MIME type: {mime_type or 'unknown'}",
+        f"Chunk count: {len(chunks)}",
+        f"Source types: {', '.join(source_types) if source_types else 'unknown'}",
+    ]
+    if sheets:
+        metadata_lines.append(f"Sheets: {', '.join(sheets[:20])}")
+    if pages:
+        metadata_lines.append(f"Page range: {min(pages)}-{max(pages)}")
+
+    sample_parts: list[str] = []
+    used = 0
+    for i, c in enumerate(chunks[:25], 1):
+        content = _truncate(c.get("content") or "", 700)
+        if not content:
+            continue
+        label_parts = [f"sample chunk {i}", str(c.get("source_type") or "unknown")]
+        if c.get("sheet_name"):
+            label_parts.append(f"sheet={c.get('sheet_name')}")
+        if c.get("page_number") is not None:
+            label_parts.append(f"page={c.get('page_number')}")
+        if c.get("row_start") is not None or c.get("row_end") is not None:
+            label_parts.append(f"rows={c.get('row_start')}-{c.get('row_end')}")
+        block = f"[{'; '.join(label_parts)}]\n{content}"
+        if used + len(block) > CONTEXTUALIZATION_DOC_SAMPLE_CHARS:
+            break
+        sample_parts.append(block)
+        used += len(block)
+
+    return "\n".join(metadata_lines) + "\n\nDocument sample:\n" + "\n\n---\n\n".join(sample_parts)
+
+
+def _chunk_location(chunk: dict) -> str:
+    parts = [str(chunk.get("source_type") or "unknown")]
+    if chunk.get("page_number") is not None:
+        parts.append(f"page {chunk.get('page_number')}")
+    if chunk.get("sheet_name"):
+        parts.append(f"sheet {chunk.get('sheet_name')}")
+    if chunk.get("row_start") is not None or chunk.get("row_end") is not None:
+        parts.append(f"rows {chunk.get('row_start')}-{chunk.get('row_end')}")
+    md = chunk.get("metadata_jsonb") or {}
+    if isinstance(md, dict):
+        if md.get("heading"):
+            parts.append(f"section {md.get('heading')}")
+        if md.get("sender"):
+            parts.append(f"sender {md.get('sender')}")
+        if md.get("timestamp_start"):
+            parts.append(f"from {md.get('timestamp_start')}")
+    return ", ".join(parts)
+
+
+def contextualize_chunk(chunk: dict, document_context: str, original_filename: str) -> dict:
+    """Return contextual_summary, embedding_text, and error for a single chunk.
+
+    Failure is non-fatal. The worker will embed original content if contextualization
+    fails or is disabled.
+    """
+    original_content = chunk.get("content") or ""
+    if not ENABLE_CONTEXTUAL_RETRIEVAL:
+        return {
+            "contextual_summary": None,
+            "embedding_text": original_content,
+            "contextualization_model": None,
+            "contextualization_error": None,
+        }
+
+    if anthropic_client is None:
+        return {
+            "contextual_summary": None,
+            "embedding_text": original_content,
+            "contextualization_model": None,
+            "contextualization_error": "ANTHROPIC_API_KEY missing; contextual retrieval skipped",
+        }
+
+    try:
+        instructions = (
+            "You are improving retrieval for an oilfield document RAG system. "
+            "Given cached document context and one chunk, write retrieval context for the chunk. "
+            "Mention concrete identifiers if present: invoice number, ticket number, truck ID, driver, "
+            "vendor, customer, well/lease, job number, date, sheet, page, or row range. "
+            "Do not answer questions. Do not invent facts. "
+            "Output exactly one sentence, starting directly with the content description. "
+            "No labels, bullets, prefixes, or explanations."
+        )
+        user_prompt = (
+            f"Chunk location: {_chunk_location(chunk)}\n\n"
+            f"Chunk text:\n{_truncate(original_content, CONTEXTUALIZATION_CHUNK_CHARS)}"
+        )
+
+        # Cache the repeated document context across all chunk-contextualization
+        # calls for this file. The chunk text stays uncached/dynamic.
+        response = anthropic_client.messages.create(
+            model=CONTEXTUALIZATION_MODEL,
+            max_tokens=CONTEXTUALIZATION_MAX_TOKENS,
+            temperature=0,
+            system=[
+                {"type": "text", "text": instructions},
+                {
+                    "type": "text",
+                    "text": f"Document context:\n{document_context}",
+                    "cache_control": {"type": "ephemeral"},
+                },
+            ],
+            messages=[{"role": "user", "content": user_prompt}],
+        )
+        summary = " ".join((response.content[0].text or "").strip().strip('"').split())
+        if not summary:
+            return {
+                "contextual_summary": None,
+                "embedding_text": original_content,
+                "contextualization_model": CONTEXTUALIZATION_MODEL,
+                "contextualization_error": "empty contextual summary",
+            }
+
+        # Keep artificial context out of citations by storing it separately and
+        # embedding this combined text only.
+        embedding_text = f"{summary}\n\n{original_content}"
+        return {
+            "contextual_summary": summary,
+            "embedding_text": embedding_text,
+            "contextualization_model": CONTEXTUALIZATION_MODEL,
+            "contextualization_error": None,
+        }
+    except Exception as e:
+        return {
+            "contextual_summary": None,
+            "embedding_text": original_content,
+            "contextualization_model": CONTEXTUALIZATION_MODEL,
+            "contextualization_error": str(e)[:500],
+        }
+
+
+def contextualize_chunks(chunks: list[dict], original_filename: str, mime_type: str) -> list[dict]:
+    """Attach contextual retrieval fields to chunks.
+
+    If a document has more chunks than CONTEXTUALIZATION_MAX_CHUNKS, only the first
+    N are contextualized. The rest still embed original content and process normally.
+    This protects cost and prevents one massive file from stalling the worker.
+    """
+    if not chunks:
+        return chunks
+
+    document_context = build_document_context(chunks, original_filename, mime_type)
+    out: list[dict] = []
+
+    if ENABLE_CONTEXTUAL_RETRIEVAL and len(chunks) > CONTEXTUALIZATION_MAX_CHUNKS:
+        print(
+            f"  Warning: {len(chunks)} chunks found; contextualizing first "
+            f"{CONTEXTUALIZATION_MAX_CHUNKS} and embedding the rest without generated context"
+        )
+
+    for i, chunk in enumerate(chunks):
+        enriched = dict(chunk)
+
+        if ENABLE_CONTEXTUAL_RETRIEVAL and i >= CONTEXTUALIZATION_MAX_CHUNKS:
+            ctx = {
+                "contextual_summary": None,
+                "embedding_text": chunk.get("content") or "",
+                "contextualization_model": CONTEXTUALIZATION_MODEL,
+                "contextualization_error": f"skipped: exceeds per-file contextualization limit ({CONTEXTUALIZATION_MAX_CHUNKS})",
+            }
+        else:
+            ctx = contextualize_chunk(chunk, document_context, original_filename)
+
+        enriched.update(ctx)
+        out.append(enriched)
+
+        if CONTEXTUALIZATION_SLEEP_MS > 0 and ENABLE_CONTEXTUAL_RETRIEVAL:
+            time.sleep(CONTEXTUALIZATION_SLEEP_MS / 1000)
+
+    return out
+
 
 
 def looks_like_whatsapp_export(text: str) -> bool:
@@ -194,10 +399,15 @@ def process_job(sb: Client, job: dict):
     if not chunks:
         raise ValueError("Parser returned no chunks — file may be empty or unreadable")
 
-    print(f"  Got {len(chunks)} chunks, embedding now")
+    print(f"  Got {len(chunks)} chunks")
 
+    if ENABLE_CONTEXTUAL_RETRIEVAL:
+        print(f"  Contextual retrieval enabled — contextualizing up to {CONTEXTUALIZATION_MAX_CHUNKS} chunks")
+    chunks = contextualize_chunks(chunks, original_filename, mime_type)
+
+    print("  Embedding chunks")
     update_file_status(sb, version_id, "embedding")
-    texts = [c["content"] for c in chunks]
+    texts = [c.get("embedding_text") or c["content"] for c in chunks]
     embeddings = embed_chunks(texts)
 
     print("  Writing chunks to database")
@@ -210,8 +420,13 @@ def process_job(sb: Client, job: dict):
             "file_version_id": version_id,
             "chunk_index": i,
             "content": chunk["content"],
+            "embedding_text": chunk.get("embedding_text") or chunk["content"],
+            "contextual_summary": chunk.get("contextual_summary"),
+            "contextualized_at": "now()" if chunk.get("contextual_summary") else None,
+            "contextualization_model": chunk.get("contextualization_model"),
+            "contextualization_error": chunk.get("contextualization_error"),
             "embedding": embedding,
-            "token_count": len(chunk["content"].split()),
+            "token_count": len((chunk.get("embedding_text") or chunk["content"]).split()),
             "source_type": chunk["source_type"],
             "page_number": chunk.get("page_number"),
             "sheet_name": chunk.get("sheet_name"),
