@@ -9,8 +9,7 @@ import uuid
 import json
 import asyncio
 import time
-from datetime import datetime, date
-from decimal import Decimal
+from datetime import datetime
 from typing import Optional, AsyncGenerator
 
 import asyncpg
@@ -93,21 +92,6 @@ _SB_CLIENT: Client = create_client(
 
 ai   = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 ant  = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
-
-def _jsonable(value):
-    """Convert asyncpg/Supabase values that JSON cannot serialize by default."""
-    if isinstance(value, Decimal):
-        return float(value)
-    if isinstance(value, (datetime, date)):
-        return value.isoformat()
-    if isinstance(value, uuid.UUID):
-        return str(value)
-    if isinstance(value, list):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, dict):
-        return {k: _jsonable(v) for k, v in value.items()}
-    return value
-
 
 # ── Auth ───────────────────────────────────────────────────────────────────────
 
@@ -478,6 +462,60 @@ def _build_context(session: dict, recent: list) -> str:
             lines.append(f"{label}: {(m.get('content') or '')[:400]}")
         parts.append("\n".join(lines))
     return "\n\n".join(parts)
+
+
+async def _rewrite_search_query(question: str, recent: list) -> str:
+    """Rewrite follow-up questions into standalone retrieval queries.
+
+    Claude should still answer the user's original question. This rewritten text is
+    used only for embedding, keyword search, and reranking. Fallback is always the
+    original question so rewrite failures never break chat.
+    """
+    q = (question or "").strip()
+    if not q:
+        return q
+
+    # First-turn questions are usually already standalone. Avoid spending Haiku
+    # calls unless prior conversation context exists.
+    prior = [m for m in (recent or []) if (m.get("content") or "").strip()]
+    if not prior:
+        return q
+
+    # Keep this short and cheap. We need retrieval wording, not a polished answer.
+    convo_lines = []
+    for m in prior[-6:]:
+        role = "User" if m.get("role") == "user" else "Assistant"
+        content = " ".join((m.get("content") or "").split())[:500]
+        convo_lines.append(f"{role}: {content}")
+    convo = "\n".join(convo_lines)
+
+    try:
+        model = os.environ.get("ANTHROPIC_QUERY_REWRITE_MODEL", "claude-haiku-4-5-20251001")
+        r = await ant.messages.create(
+            model=model,
+            max_tokens=120,
+            temperature=0,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Rewrite the current user question into a standalone search query for retrieving oilfield documents.\n"
+                    "Resolve pronouns, ellipses, dates, trucks, wells, invoices, tickets, and references from the conversation.\n"
+                    "Do not answer the question. Do not add facts not implied by the conversation.\n"
+                    "Return only the rewritten search query as plain text.\n\n"
+                    f"Conversation:\n{convo}\n\n"
+                    f"Current user question: {q}"
+                ),
+            }],
+        )
+        rewritten = (r.content[0].text or "").strip().strip('"')
+        if not rewritten:
+            return q
+        if len(rewritten) > 500:
+            return rewritten[:500]
+        return rewritten
+    except Exception as e:
+        print(f"query rewrite failed; using original question: {e}")
+        return q
 
 async def _maybe_summarize(sid: uuid.UUID, uid: uuid.UUID,
                            count: int, history: str):
@@ -875,8 +913,9 @@ async def _insert_rag_log(
     uid: uuid.UUID,
     sid: uuid.UUID,
     question: str,
-    intent_type: str,
-    retrieval_used: bool,
+    rewritten_query: str | None = None,
+    intent_type: str = "rag",
+    retrieval_used: bool = False,
     rerank_used: bool,
     refused: bool,
     refusal_reason: str | None,
@@ -899,6 +938,7 @@ async def _insert_rag_log(
             "user_id": str(uid),
             "session_id": str(sid),
             "question": question,
+            "rewritten_query": rewritten_query,
             "intent_type": intent_type,
             "retrieval_used": retrieval_used,
             "rerank_used": rerank_used,
@@ -920,14 +960,14 @@ async def _insert_rag_log(
                 await c.execute(
                     """
                     insert into rag_query_logs(
-                        company_id, user_id, session_id, question, intent_type,
+                        company_id, user_id, session_id, question, rewritten_query, intent_type,
                         retrieval_used, rerank_used, refused, refusal_reason,
                         top_combined_score, top_vector_score, top_text_score, top_rerank_score,
                         retrieved_chunks_json, citations_count, model, tokens_used, latency_ms
                     )
-                    values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15,$16,$17,$18)
+                    values($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16,$17,$18,$19)
                     """,
-                    cid, uid, sid, question, intent_type,
+                    cid, uid, sid, question, rewritten_query, intent_type,
                     retrieval_used, rerank_used, refused, refusal_reason,
                     row["top_combined_score"], row["top_vector_score"], row["top_text_score"], row["top_rerank_score"],
                     json.dumps(row["retrieved_chunks_json"]), citations_count, model, tokens_used or 0, latency_ms,
@@ -1036,9 +1076,13 @@ async def ask(b: AskBody, u=Depends(get_user)):
             headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"},
         )
 
+    # Rewrite follow-up questions into standalone retrieval queries before embedding.
+    # Claude still receives and answers the original user question.
+    rewritten_query = await _rewrite_search_query(q, recent)
+
     # Embed
     try:
-        emb = await ai.embeddings.create(model="text-embedding-3-small", input=q)
+        emb = await ai.embeddings.create(model="text-embedding-3-small", input=rewritten_query)
     except Exception as e:
         err = str(e).lower()
         if any(w in err for w in ["quota", "billing", "insufficient", "credit"]):
@@ -1053,7 +1097,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
         sb.rpc("hybrid_search", {
             "p_company_id": str(cid),
             "p_query_embedding": query_embedding,
-            "p_query_text": q,
+            "p_query_text": rewritten_query,
             "p_match_count": 20,
         })
         .execute()
@@ -1075,8 +1119,8 @@ async def ask(b: AskBody, u=Depends(get_user)):
                 fname_map[r["id"]] = r["original_filename"]
 
     # Rerank: first-stage retrieval gets 20 candidates, second-stage picks best 8.
-    chunks = await _rerank_chunks(q, chunks, fname_map, top_n=8)
-    _log_retrieval(q, chunks, fname_map)
+    chunks = await _rerank_chunks(rewritten_query, chunks, fname_map, top_n=8)
+    _log_retrieval(rewritten_query, chunks, fname_map)
 
     if _evidence_is_too_weak(chunks):
         async def weak_evidence():
@@ -1085,7 +1129,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
             yield f"data: {json.dumps({'type':'token','text':msg})}\n\n"
             yield f"data: {json.dumps({'type':'done','citations':[]})}\n\n"
             asyncio.create_task(_insert_rag_log(
-                cid=cid, uid=uid, sid=sid, question=q, intent_type="rag",
+                cid=cid, uid=uid, sid=sid, question=q, rewritten_query=rewritten_query, intent_type="rag",
                 retrieval_used=True,
                 rerank_used=any(c.get("rerank_score") is not None for c in chunks),
                 refused=True,
@@ -1171,7 +1215,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
         # Save after streaming — non-blocking
         asyncio.create_task(_save(sid, cid, uid, q, full, citations, new_count, history, srow, tokens_used))
         asyncio.create_task(_insert_rag_log(
-            cid=cid, uid=uid, sid=sid, question=q, intent_type="rag",
+            cid=cid, uid=uid, sid=sid, question=q, rewritten_query=rewritten_query, intent_type="rag",
             retrieval_used=True,
             rerank_used=any(c.get("rerank_score") is not None for c in chunks),
             refused=False,
@@ -1217,189 +1261,6 @@ async def _save(sid, cid, uid, q, answer, citations, count, history, srow, token
         await _maybe_summarize(sid,uid,count,history)
     except Exception as e:
         print(f"_save error: {e}")
-
-
-# ── Invoice extraction review API ──────────────────────────────────────────────
-# This is the review/edit surface for structured invoice extraction.
-# It does not run extraction by itself. The worker/extractor will populate these tables later.
-
-class InvoicePatch(BaseModel):
-    invoice_number: Optional[str] = None
-    invoice_date: Optional[str] = None
-    due_date: Optional[str] = None
-    vendor_name: Optional[str] = None
-    customer_name: Optional[str] = None
-    lease_or_well: Optional[str] = None
-    job_number: Optional[str] = None
-    ticket_number: Optional[str] = None
-    subtotal: Optional[float] = None
-    tax: Optional[float] = None
-    total_amount: Optional[float] = None
-    currency: Optional[str] = None
-    extraction_confidence: Optional[float] = None
-    requires_human_review: Optional[bool] = None
-    review_status: Optional[str] = None
-    extraction_error: Optional[str] = None
-
-
-def _is_admin_or_owner(u: dict) -> bool:
-    return (u.get("role") or "").lower() in {"owner", "admin"}
-
-
-@app.get("/extractions/invoices")
-async def list_invoice_extractions(
-    review_status: Optional[str] = None,
-    requires_review: Optional[bool] = None,
-    limit: int = 50,
-    u=Depends(get_user),
-):
-    """List structured invoice records for the user's company."""
-    cid = uuid.UUID(str(u["company_id"]))
-    limit = max(1, min(limit, 200))
-
-    if DB_POOL:
-        async with DB_POOL.acquire() as c:
-            conditions = ["ir.company_id=$1"]
-            args = [cid]
-            idx = 2
-            if review_status:
-                conditions.append(f"ir.review_status=${idx}")
-                args.append(review_status)
-                idx += 1
-            if requires_review is not None:
-                conditions.append(f"ir.requires_human_review=${idx}")
-                args.append(requires_review)
-                idx += 1
-
-            sql = f"""
-                select
-                  ir.*,
-                  fv.original_filename as filename,
-                  count(ili.id)::int as line_item_count
-                from invoice_records ir
-                left join file_versions fv on fv.id = ir.file_version_id
-                left join invoice_line_items ili on ili.invoice_record_id = ir.id
-                where {' and '.join(conditions)}
-                group by ir.id, fv.original_filename
-                order by ir.created_at desc
-                limit ${idx}
-            """
-            args.append(limit)
-            rows = await c.fetch(sql, *args)
-            return [_jsonable(dict(r)) for r in rows]
-
-    sb = _sb()
-    q = sb.table("invoice_records").select("*").eq("company_id", str(cid)).order("created_at", desc=True).limit(limit)
-    if review_status:
-        q = q.eq("review_status", review_status)
-    if requires_review is not None:
-        q = q.eq("requires_human_review", requires_review)
-    return q.execute().data or []
-
-
-@app.get("/extractions/invoices/{invoice_id}")
-async def get_invoice_extraction(invoice_id: str, u=Depends(get_user)):
-    """Return one invoice extraction plus line items."""
-    cid = uuid.UUID(str(u["company_id"]))
-    iid = uuid.UUID(invoice_id)
-
-    if DB_POOL:
-        async with DB_POOL.acquire() as c:
-            rec = await c.fetchrow(
-                """
-                select ir.*, fv.original_filename as filename
-                from invoice_records ir
-                left join file_versions fv on fv.id = ir.file_version_id
-                where ir.id=$1 and ir.company_id=$2
-                """,
-                iid, cid,
-            )
-            if not rec:
-                raise HTTPException(404, "Invoice extraction not found")
-
-            items = await c.fetch(
-                """
-                select *
-                from invoice_line_items
-                where invoice_record_id=$1 and company_id=$2
-                order by line_number nulls last, created_at asc
-                """,
-                iid, cid,
-            )
-            out = _jsonable(dict(rec))
-            out["line_items"] = [_jsonable(dict(x)) for x in items]
-            return out
-
-    sb = _sb()
-    rec = sb.table("invoice_records").select("*").eq("id", invoice_id).eq("company_id", str(cid)).single().execute()
-    if not rec.data:
-        raise HTTPException(404, "Invoice extraction not found")
-    items = sb.table("invoice_line_items").select("*").eq("invoice_record_id", invoice_id).eq("company_id", str(cid)).order("line_number", desc=False).execute().data or []
-    out = rec.data
-    out["line_items"] = items
-    return out
-
-
-@app.patch("/extractions/invoices/{invoice_id}")
-async def update_invoice_extraction(invoice_id: str, patch: InvoicePatch, u=Depends(get_user)):
-    """Admin/owner review endpoint for correcting structured invoice fields."""
-    if not _is_admin_or_owner(u):
-        raise HTTPException(403, "Only owner/admin users can review invoice extractions.")
-
-    cid = uuid.UUID(str(u["company_id"]))
-    iid = uuid.UUID(invoice_id)
-
-    allowed_review_statuses = {"pending", "approved", "corrected", "rejected"}
-    data = patch.model_dump(exclude_unset=True)
-
-    if "review_status" in data and data["review_status"] not in allowed_review_statuses:
-        raise HTTPException(400, "review_status must be pending, approved, corrected, or rejected")
-
-    if "currency" in data and data["currency"]:
-        data["currency"] = data["currency"].upper()[:3]
-
-    # Any manual patch means the record has been reviewed/corrected unless caller explicitly rejects/approves it.
-    data["reviewed_by"] = str(u["id"])
-    data["reviewed_at"] = datetime.utcnow().isoformat()
-    data["updated_at"] = datetime.utcnow().isoformat()
-    if "review_status" not in data:
-        data["review_status"] = "corrected"
-    if data.get("review_status") in {"approved", "corrected"}:
-        data["requires_human_review"] = False
-
-    if DB_POOL:
-        if not data:
-            raise HTTPException(400, "No fields to update")
-
-        columns = []
-        args = []
-        idx = 1
-        for key, value in data.items():
-            columns.append(f"{key}=${idx}")
-            if key in {"reviewed_by"} and value:
-                args.append(uuid.UUID(str(value)))
-            else:
-                args.append(value)
-            idx += 1
-
-        args.extend([iid, cid])
-        sql = f"""
-            update invoice_records
-            set {', '.join(columns)}
-            where id=${idx} and company_id=${idx + 1}
-            returning *
-        """
-        async with DB_POOL.acquire() as c:
-            row = await c.fetchrow(sql, *args)
-            if not row:
-                raise HTTPException(404, "Invoice extraction not found")
-            return _jsonable(dict(row))
-
-    sb = _sb()
-    updated = sb.table("invoice_records").update(data).eq("id", invoice_id).eq("company_id", str(cid)).execute().data or []
-    if not updated:
-        raise HTTPException(404, "Invoice extraction not found")
-    return updated[0]
 
 @app.get("/health")
 async def health():
