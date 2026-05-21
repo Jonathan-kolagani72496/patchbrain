@@ -1,7 +1,11 @@
 'use client'
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { useRouter } from 'next/navigation'
 import { supabase, getAuthHeader, API_URL } from '@/lib/supabase'
+import ReactMarkdown from 'react-markdown'
+import remarkGfm from 'remark-gfm'
+
+// ── Types ──────────────────────────────────────────────────────────────────────
 
 type Citation = {
   index: number
@@ -33,18 +37,177 @@ type Session = {
   updated_at: string
 }
 
+// ── Skeleton component ─────────────────────────────────────────────────────────
+
+function MessageSkeleton() {
+  return (
+    <div className="space-y-5 animate-pulse">
+      {[80, 55, 95, 65].map((w, i) => (
+        <div key={i} className={`flex ${i % 2 === 0 ? 'justify-end' : 'justify-start'}`}>
+          <div
+            className={`h-9 rounded-2xl bg-gray-800 ${i % 2 === 0 ? 'rounded-tr-sm' : 'rounded-tl-sm'}`}
+            style={{ width: `${w}%` }}
+          />
+        </div>
+      ))}
+    </div>
+  )
+}
+
+// ── Markdown renderer with citation injection ──────────────────────────────────
+
+function AssistantMarkdown({
+  content,
+  citations,
+  streaming,
+  onCitationClick,
+}: {
+  content: string
+  citations: Citation[]
+  streaming?: boolean
+  onCitationClick: (c: Citation) => void
+}) {
+  // During streaming: avoid markdown flickering on partial bold/headers.
+  // Render plain text with cursor until streaming finishes.
+  if (streaming) {
+    return (
+      <p className="text-sm leading-7 text-gray-200 whitespace-pre-wrap">
+        {content}
+        <span className="inline-block w-0.5 h-4 bg-orange-400 animate-pulse ml-0.5 align-text-bottom" />
+      </p>
+    )
+  }
+
+  // Post-stream: split on [S1] tags BEFORE passing to ReactMarkdown so we can
+  // inject clickable citation buttons inline with the rendered markdown.
+  // Strategy: replace [S1] with a placeholder, render markdown, then swap back.
+  const CITE_RE = /\[S(\d+)\]/g
+
+  // Build a version where citation tags become unique unicode placeholders
+  // that survive markdown rendering untouched.
+  const placeholders: { placeholder: string; index: number }[] = []
+  let idx = 0
+  const withPlaceholders = content.replace(CITE_RE, (_, num) => {
+    const ph = `\u{E0000}${idx}\u{E0001}` // Private Use Area chars — won't appear in real text
+    placeholders.push({ placeholder: ph, index: parseInt(num) })
+    idx++
+    return ph
+  })
+
+  // Custom renderer that splits text nodes on placeholders and injects buttons
+  const renderText = (text: string): React.ReactNode[] => {
+    if (!placeholders.length || !text.includes('\u{E0000}')) return [text]
+    const parts = text.split(/(\u{E0000}\d+\u{E0001})/u)
+    return parts.map((part, i) => {
+      const ph = placeholders.find(p => p.placeholder === part)
+      if (ph) {
+        const c = citations.find(c => c.index === ph.index)
+        return (
+          <button
+            key={i}
+            onClick={() => c && onCitationClick(c)}
+            className="inline-flex items-center bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 text-xs font-semibold px-1.5 py-0.5 rounded mx-0.5 transition-colors cursor-pointer"
+          >
+            [S{ph.index}]
+          </button>
+        )
+      }
+      return part
+    })
+  }
+
+  return (
+    <div className="prose-chat">
+      <ReactMarkdown
+        remarkPlugins={[remarkGfm]}
+        components={{
+          // Paragraphs
+          p: ({ children }) => (
+            <p className="text-sm leading-7 text-gray-200 mb-3 last:mb-0">
+              {processChildren(children, renderText)}
+            </p>
+          ),
+          // Headings
+          h1: ({ children }) => <h1 className="text-base font-semibold text-white mt-4 mb-2">{children}</h1>,
+          h2: ({ children }) => <h2 className="text-sm font-semibold text-white mt-4 mb-2">{children}</h2>,
+          h3: ({ children }) => <h3 className="text-sm font-medium text-gray-100 mt-3 mb-1">{children}</h3>,
+          // Lists
+          ul: ({ children }) => <ul className="text-sm text-gray-200 space-y-1 mb-3 ml-4 list-disc">{children}</ul>,
+          ol: ({ children }) => <ol className="text-sm text-gray-200 space-y-1 mb-3 ml-4 list-decimal">{children}</ol>,
+          li: ({ children }) => (
+            <li className="leading-6">
+              {processChildren(children, renderText)}
+            </li>
+          ),
+          // Bold / italic
+          strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
+          em: ({ children }) => <em className="italic text-gray-300">{children}</em>,
+          // Code
+          code: ({ inline, children }: any) =>
+            inline ? (
+              <code className="bg-gray-800 text-orange-300 text-xs px-1.5 py-0.5 rounded font-mono">{children}</code>
+            ) : (
+              <pre className="bg-gray-800 rounded-lg p-3 overflow-x-auto mb-3">
+                <code className="text-xs text-gray-300 font-mono">{children}</code>
+              </pre>
+            ),
+          // Tables
+          table: ({ children }) => (
+            <div className="overflow-x-auto mb-3">
+              <table className="text-xs text-gray-300 border-collapse w-full">{children}</table>
+            </div>
+          ),
+          th: ({ children }) => <th className="border border-gray-700 bg-gray-800 px-3 py-1.5 text-left font-medium text-gray-200">{children}</th>,
+          td: ({ children }) => <td className="border border-gray-700 px-3 py-1.5">{children}</td>,
+          // Blockquote
+          blockquote: ({ children }) => (
+            <blockquote className="border-l-2 border-orange-500/50 pl-3 text-gray-400 italic mb-3">{children}</blockquote>
+          ),
+          // Horizontal rule
+          hr: () => <hr className="border-gray-700 my-4" />,
+          // Text nodes — inject citation buttons
+          text: ({ children }: any) => <>{renderText(String(children))}</>,
+        }}
+      >
+        {withPlaceholders}
+      </ReactMarkdown>
+    </div>
+  )
+}
+
+// Helper: recursively process react children to inject citation buttons into text nodes
+function processChildren(children: React.ReactNode, renderText: (s: string) => React.ReactNode[]): React.ReactNode {
+  if (typeof children === 'string') return <>{renderText(children)}</>
+  if (Array.isArray(children)) return <>{children.map((c, i) => <span key={i}>{processChildren(c, renderText)}</span>)}</>
+  return children
+}
+
+// ── Main component ─────────────────────────────────────────────────────────────
+
 export default function ChatPage() {
   const router = useRouter()
-  const [sessions, setSessions]                 = useState<Session[]>([])
-  const [activeSession, setActiveSession]       = useState<string | null>(null)
-  const [messages, setMessages]                 = useState<Message[]>([])
-  const [input, setInput]                       = useState('')
-  const [sending, setSending]                   = useState(false)
-  const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null)
-  const [companyName, setCompanyName]           = useState('PatchBrain')
-  const [error, setError]                       = useState('')
-  const bottomRef = useRef<HTMLDivElement>(null)
-  const inputRef  = useRef<HTMLTextAreaElement>(null)
+
+  const [sessions, setSessions]                   = useState<Session[]>([])
+  const [activeSession, setActiveSession]         = useState<string | null>(null)
+  const [messages, setMessages]                   = useState<Message[]>([])
+  const [loadingHistory, setLoadingHistory]       = useState(false)
+  const [input, setInput]                         = useState('')
+  const [sending, setSending]                     = useState(false)
+  const [selectedCitation, setSelectedCitation]   = useState<Citation | null>(null)
+  const [companyName, setCompanyName]             = useState('PatchBrain')
+  const [error, setError]                         = useState('')
+  const [followUps, setFollowUps]                 = useState<string[]>([])
+  const [showScrollBtn, setShowScrollBtn]         = useState(false)
+  const [copiedId, setCopiedId]                   = useState<string | null>(null)
+  const [hoveredMsg, setHoveredMsg]               = useState<string | null>(null)
+
+  const bottomRef      = useRef<HTMLDivElement>(null)
+  const inputRef       = useRef<HTMLTextAreaElement>(null)
+  const scrollAreaRef  = useRef<HTMLDivElement>(null)
+  const readerRef      = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
+  const lastQuestionRef = useRef<string>('')
+
+  // ── Auth + init ──────────────────────────────────────────────────────────────
 
   useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
@@ -54,9 +217,38 @@ export default function ChatPage() {
     loadMe()
   }, [])
 
+  // ── Auto-scroll to bottom ────────────────────────────────────────────────────
+
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    if (!showScrollBtn) {
+      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    }
   }, [messages])
+
+  // ── Scroll-to-bottom button visibility ──────────────────────────────────────
+
+  function handleScroll() {
+    const el = scrollAreaRef.current
+    if (!el) return
+    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
+    setShowScrollBtn(distFromBottom > 200)
+  }
+
+  function scrollToBottom() {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    setShowScrollBtn(false)
+  }
+
+  // ── Auto-grow textarea ───────────────────────────────────────────────────────
+
+  useEffect(() => {
+    const ta = inputRef.current
+    if (!ta) return
+    ta.style.height = 'auto'
+    ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'
+  }, [input])
+
+  // ── Data loading ─────────────────────────────────────────────────────────────
 
   async function loadMe() {
     try {
@@ -77,7 +269,10 @@ export default function ChatPage() {
   async function loadSession(sessionId: string) {
     setActiveSession(sessionId)
     setSelectedCitation(null)
+    setFollowUps([])
     setError('')
+    setLoadingHistory(true)
+    setMessages([]) // clear immediately so skeleton shows
     try {
       const headers = await getAuthHeader()
       const res = await fetch(`${API_URL}/conversations/${sessionId}/messages`, { headers })
@@ -88,11 +283,13 @@ export default function ChatPage() {
         citations: m.citations_json || [], created_at: m.created_at,
       })))
     } catch {}
+    finally { setLoadingHistory(false) }
   }
 
   async function newChat() {
     setActiveSession(null)
     setMessages([])
+    setFollowUps([])
     setSelectedCitation(null)
     setError('')
     inputRef.current?.focus()
@@ -108,13 +305,78 @@ export default function ChatPage() {
     } catch {}
   }
 
+  // ── Stop streaming ───────────────────────────────────────────────────────────
+
+  function stopStreaming() {
+    readerRef.current?.cancel()
+    readerRef.current = null
+    setSending(false)
+    // Mark last assistant message as no longer streaming
+    setMessages(prev => {
+      const copy = [...prev]
+      const last = copy[copy.length - 1]
+      if (last?.role === 'assistant') copy[copy.length - 1] = { ...last, streaming: false }
+      return copy
+    })
+  }
+
+  // ── Copy message ─────────────────────────────────────────────────────────────
+
+  async function copyMessage(id: string, content: string) {
+    try {
+      await navigator.clipboard.writeText(content)
+      setCopiedId(id)
+      setTimeout(() => setCopiedId(null), 2000)
+    } catch {}
+  }
+
+  // ── Regenerate ───────────────────────────────────────────────────────────────
+
+  function regenerate() {
+    if (!lastQuestionRef.current || sending) return
+    // Remove last assistant message and re-send
+    setMessages(prev => {
+      const copy = [...prev]
+      if (copy[copy.length - 1]?.role === 'assistant') copy.pop()
+      if (copy[copy.length - 1]?.role === 'user') copy.pop()
+      return copy
+    })
+    setInput(lastQuestionRef.current)
+    setTimeout(() => sendMessageWithText(lastQuestionRef.current), 50)
+  }
+
+  // ── Follow-up suggestions ────────────────────────────────────────────────────
+
+  async function fetchFollowUps(question: string, answer: string) {
+    try {
+      const headers = await getAuthHeader()
+      const res = await fetch(`${API_URL}/suggest-followups`, {
+        method: 'POST',
+        headers: { ...headers, 'Content-Type': 'application/json' },
+        body: JSON.stringify({ question, answer: answer.slice(0, 600) }),
+      })
+      if (res.ok) {
+        const d = await res.json()
+        setFollowUps((d.suggestions || []).slice(0, 3))
+      }
+    } catch {}
+  }
+
+  // ── Send message ─────────────────────────────────────────────────────────────
+
   async function sendMessage() {
-    if (!input.trim() || sending) return
-    const question = input.trim()
+    const text = input.trim()
+    if (!text || sending) return
     setInput('')
+    await sendMessageWithText(text)
+  }
+
+  async function sendMessageWithText(question: string) {
     setSending(true)
     setError('')
+    setFollowUps([])
     setSelectedCitation(null)
+    lastQuestionRef.current = question
 
     const userMsg: Message = { id: Date.now().toString(), role: 'user', content: question }
     setMessages(prev => [...prev, userMsg])
@@ -129,7 +391,6 @@ export default function ChatPage() {
 
       if (res.status === 401) { router.push('/login'); return }
 
-      // Handle non-streaming error responses (4xx before stream starts)
       if (!res.ok) {
         let msg = 'Something went wrong'
         try { const d = await res.json(); msg = d.detail || msg } catch {}
@@ -141,9 +402,10 @@ export default function ChatPage() {
       if (!res.body) throw new Error('No response body')
 
       const reader  = res.body.getReader()
+      readerRef.current = reader
       const decoder = new TextDecoder()
       const aId     = Date.now().toString() + '-a'
-      let assistantText  = ''
+      let assistantText   = ''
       let finalCitations: Citation[] = []
       let buffer = ''
 
@@ -153,7 +415,6 @@ export default function ChatPage() {
 
         buffer += decoder.decode(value, { stream: true })
         const events = buffer.split('\n\n')
-        // Keep incomplete last chunk in buffer
         buffer = events.pop() ?? ''
 
         for (const event of events) {
@@ -190,7 +451,10 @@ export default function ChatPage() {
                 }
                 return copy
               })
-              await loadSessions()
+              // Delay session reload so it doesn't interrupt the done animation
+              setTimeout(loadSessions, 600)
+              // Fetch follow-up suggestions in background
+              fetchFollowUps(question, assistantText)
             }
 
             if (parsed.type === 'error') {
@@ -214,7 +478,8 @@ export default function ChatPage() {
         }
       }
 
-    } catch {
+    } catch (e: any) {
+      if (e?.name === 'AbortError' || e?.message?.includes('cancel')) return // user stopped
       setMessages(prev => {
         const copy = [...prev]
         const last = copy[copy.length - 1]
@@ -226,30 +491,19 @@ export default function ChatPage() {
         return copy
       })
     } finally {
+      readerRef.current = null
       setSending(false)
       inputRef.current?.focus()
     }
   }
 
+  // ── Keyboard ─────────────────────────────────────────────────────────────────
+
   function handleKeyDown(e: React.KeyboardEvent) {
     if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
   }
 
-  function renderAnswer(text: string, citations: Citation[] = []) {
-    return text.split(/(\[S\d+\])/g).map((part, i) => {
-      const match = part.match(/\[S(\d+)\]/)
-      if (match) {
-        const c = citations.find(c => c.index === parseInt(match[1]))
-        return (
-          <button key={i} onClick={() => c && setSelectedCitation(c)}
-            className="inline-flex items-center bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 text-xs font-medium px-1.5 py-0.5 rounded mx-0.5 transition-colors">
-            {part}
-          </button>
-        )
-      }
-      return <span key={i}>{part}</span>
-    })
-  }
+  // ── Citation helpers ──────────────────────────────────────────────────────────
 
   function citationLabel(c: Citation) {
     const fname = c.filename ? (c.filename.length > 18 ? c.filename.slice(0, 18) + '…' : c.filename) : ''
@@ -268,6 +522,13 @@ export default function ChatPage() {
     const h = Math.floor(m / 60)
     if (h < 24) return `${h}h ago`
     return `${Math.floor(h / 24)}d ago`
+  }
+
+  // ── Render ────────────────────────────────────────────────────────────────────
+
+  const isLastAssistant = (msg: Message) => {
+    const assistantMsgs = messages.filter(m => m.role === 'assistant')
+    return assistantMsgs[assistantMsgs.length - 1]?.id === msg.id
   }
 
   return (
@@ -325,7 +586,7 @@ export default function ChatPage() {
       <div className="flex flex-1 overflow-hidden">
 
         {/* Messages column */}
-        <div className="flex flex-col flex-1 overflow-hidden">
+        <div className="flex flex-col flex-1 overflow-hidden relative">
           {error && (
             <div className="bg-red-500/10 border-b border-red-500/20 px-6 py-3 text-sm text-red-400 flex items-center justify-between shrink-0">
               <span>⚠ {error}</span>
@@ -333,8 +594,14 @@ export default function ChatPage() {
             </div>
           )}
 
-          <div className="flex-1 overflow-y-auto px-6 py-6 space-y-5">
-            {messages.length === 0 && (
+          {/* Scroll area */}
+          <div
+            ref={scrollAreaRef}
+            onScroll={handleScroll}
+            className="flex-1 overflow-y-auto px-6 py-6 space-y-6"
+          >
+            {/* Empty state */}
+            {!loadingHistory && messages.length === 0 && (
               <div className="h-full flex flex-col items-center justify-center text-center">
                 <div className="w-12 h-12 bg-orange-500/10 border border-orange-500/20 rounded-2xl flex items-center justify-center mb-4">
                   <span className="text-orange-400 text-xl">⚡</span>
@@ -342,7 +609,7 @@ export default function ChatPage() {
                 <h2 className="text-white font-medium mb-1">Ask about your documents</h2>
                 <p className="text-gray-500 text-sm max-w-xs mb-6">Questions are answered from your uploaded files with source citations.</p>
                 <div className="grid grid-cols-1 gap-2 w-full max-w-sm">
-                  {['Which invoices are overdue?','Are any trucks overdue for service?','Which employees have expired H2S certs?','Show run tickets missing signatures'].map(q => (
+                  {['Which invoices are overdue?', 'Are any trucks overdue for service?', 'Which employees have expired H2S certs?', 'Show run tickets missing signatures'].map(q => (
                     <button key={q} onClick={() => { setInput(q); inputRef.current?.focus() }}
                       className="text-left text-sm text-gray-400 hover:text-gray-300 bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-lg px-4 py-2.5 transition-colors">
                       {q}
@@ -352,62 +619,162 @@ export default function ChatPage() {
               </div>
             )}
 
-            {messages.map(msg => (
-              <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
-                <div className={`max-w-2xl ${msg.role === 'user' ? 'bg-gray-800 rounded-2xl rounded-tr-sm px-4 py-3' : ''}`}>
-                  {msg.loading ? (
-                    <div className="flex items-center gap-2 text-gray-400 text-sm">
-                      <span className="w-4 h-4 border-2 border-gray-600 border-t-orange-400 rounded-full animate-spin" />
-                      Searching your files…
+            {/* Skeleton while loading history */}
+            {loadingHistory && <MessageSkeleton />}
+
+            {/* Messages */}
+            {!loadingHistory && messages.map(msg => (
+              <div
+                key={msg.id}
+                className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} group/msg`}
+                onMouseEnter={() => setHoveredMsg(msg.id)}
+                onMouseLeave={() => setHoveredMsg(null)}
+              >
+                <div className={`max-w-3xl w-full ${msg.role === 'user' ? 'flex justify-end' : ''}`}>
+
+                  {/* User bubble */}
+                  {msg.role === 'user' && (
+                    <div className="bg-gray-800 rounded-2xl rounded-tr-sm px-4 py-3 max-w-xl">
+                      <p className="text-sm text-white leading-relaxed">{msg.content}</p>
                     </div>
-                  ) : (
-                    <>
-                      <div className={`text-sm leading-relaxed whitespace-pre-wrap ${msg.role === 'user' ? 'text-white' : 'text-gray-200'}`}>
-                        {msg.role === 'assistant' && msg.citations?.length
-                          ? renderAnswer(msg.content, msg.citations)
-                          : msg.content}
-                        {msg.streaming && (
-                          <span className="inline-block w-0.5 h-4 bg-orange-400 animate-pulse ml-0.5 align-text-bottom" />
-                        )}
-                      </div>
-                      {msg.citations && msg.citations.length > 0 && (
-                        <div className="mt-2.5 flex flex-wrap gap-1.5">
-                          {msg.citations.slice(0, 8).map(c => (
-                            <button key={c.chunk_id}
-                              onClick={() => setSelectedCitation(selectedCitation?.chunk_id === c.chunk_id ? null : c)}
-                              className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
-                                selectedCitation?.chunk_id === c.chunk_id
-                                  ? 'bg-orange-500/20 border-orange-500/40 text-orange-300'
-                                  : 'bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-600'
-                              }`}>
-                              [{c.index}] {citationLabel(c)}
-                            </button>
-                          ))}
+                  )}
+
+                  {/* Assistant message */}
+                  {msg.role === 'assistant' && (
+                    <div className="w-full">
+                      {msg.loading ? (
+                        <div className="flex items-center gap-2 text-gray-400 text-sm py-2">
+                          <span className="w-4 h-4 border-2 border-gray-600 border-t-orange-400 rounded-full animate-spin" />
+                          Searching your files…
                         </div>
+                      ) : (
+                        <>
+                          {/* Markdown content */}
+                          <AssistantMarkdown
+                            content={msg.content}
+                            citations={msg.citations || []}
+                            streaming={msg.streaming}
+                            onCitationClick={setSelectedCitation}
+                          />
+
+                          {/* Citation pills */}
+                          {msg.citations && msg.citations.length > 0 && !msg.streaming && (
+                            <div className="mt-3 flex flex-wrap gap-1.5">
+                              {msg.citations.slice(0, 8).map(c => (
+                                <button key={c.chunk_id}
+                                  onClick={() => setSelectedCitation(selectedCitation?.chunk_id === c.chunk_id ? null : c)}
+                                  className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
+                                    selectedCitation?.chunk_id === c.chunk_id
+                                      ? 'bg-orange-500/20 border-orange-500/40 text-orange-300'
+                                      : 'bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-600'
+                                  }`}>
+                                  [{c.index}] {citationLabel(c)}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+
+                          {/* Action buttons — visible on hover, only when not streaming */}
+                          {!msg.streaming && hoveredMsg === msg.id && (
+                            <div className="flex items-center gap-1 mt-2 transition-opacity">
+                              {/* Copy */}
+                              <button
+                                onClick={() => copyMessage(msg.id, msg.content)}
+                                title="Copy response"
+                                className="flex items-center gap-1 text-gray-500 hover:text-gray-300 text-xs px-2 py-1 rounded-md hover:bg-gray-800 transition-colors"
+                              >
+                                {copiedId === msg.id ? (
+                                  <><span className="text-green-400">✓</span><span className="text-green-400">Copied</span></>
+                                ) : (
+                                  <><CopyIcon /><span>Copy</span></>
+                                )}
+                              </button>
+
+                              {/* Regenerate — only on the last assistant message */}
+                              {isLastAssistant(msg) && !sending && (
+                                <button
+                                  onClick={regenerate}
+                                  title="Regenerate response"
+                                  className="flex items-center gap-1 text-gray-500 hover:text-gray-300 text-xs px-2 py-1 rounded-md hover:bg-gray-800 transition-colors"
+                                >
+                                  <RegenerateIcon />
+                                  <span>Regenerate</span>
+                                </button>
+                              )}
+
+                              {/* Timestamp — on hover only */}
+                              {msg.created_at && (
+                                <span className="text-gray-600 text-xs ml-1">{timeAgo(msg.created_at)}</span>
+                              )}
+                            </div>
+                          )}
+                        </>
                       )}
-                      {msg.created_at && (
-                        <p className="text-gray-600 text-xs mt-1.5">{timeAgo(msg.created_at)}</p>
-                      )}
-                    </>
+                    </div>
                   )}
                 </div>
               </div>
             ))}
+
+            {/* Follow-up suggestion chips */}
+            {followUps.length > 0 && !sending && (
+              <div className="flex flex-wrap gap-2 pt-1 animate-fade-in">
+                {followUps.map((q, i) => (
+                  <button
+                    key={i}
+                    onClick={() => { setFollowUps([]); setInput(q); setTimeout(sendMessage, 50) }}
+                    className="text-xs text-gray-300 bg-gray-800 hover:bg-gray-700 border border-gray-700 hover:border-gray-600 rounded-full px-3 py-1.5 transition-colors"
+                  >
+                    {q} →
+                  </button>
+                ))}
+              </div>
+            )}
+
             <div ref={bottomRef} />
           </div>
+
+          {/* Scroll-to-bottom button */}
+          {showScrollBtn && (
+            <button
+              onClick={scrollToBottom}
+              className="absolute bottom-24 right-6 w-8 h-8 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-full flex items-center justify-center text-gray-300 hover:text-white shadow-lg transition-all z-10"
+            >
+              ↓
+            </button>
+          )}
 
           {/* Input bar */}
           <div className="border-t border-gray-800 px-6 py-4 shrink-0">
             <div className="flex items-end gap-3 bg-gray-900 border border-gray-700 focus-within:border-gray-600 rounded-xl px-4 py-3 transition-colors">
-              <textarea ref={inputRef} value={input}
-                onChange={e => setInput(e.target.value)} onKeyDown={handleKeyDown}
-                placeholder="Ask about your files… (Enter to send)"
-                rows={1} style={{ maxHeight: '120px' }}
-                className="flex-1 bg-transparent text-white text-sm placeholder-gray-500 resize-none focus:outline-none" />
-              <button onClick={sendMessage} disabled={!input.trim() || sending}
-                className="shrink-0 bg-orange-500 hover:bg-orange-600 disabled:bg-gray-700 disabled:text-gray-500 text-white w-8 h-8 rounded-lg flex items-center justify-center transition-colors">
-                ↑
-              </button>
+              <textarea
+                ref={inputRef}
+                value={input}
+                onChange={e => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                placeholder="Ask about your files… (Enter to send, Shift+Enter for new line)"
+                rows={1}
+                style={{ maxHeight: '120px', resize: 'none' }}
+                className="flex-1 bg-transparent text-white text-sm placeholder-gray-500 focus:outline-none overflow-y-auto"
+              />
+              {/* Stop button while streaming / Send button otherwise */}
+              {sending ? (
+                <button
+                  onClick={stopStreaming}
+                  title="Stop generating"
+                  className="shrink-0 bg-gray-700 hover:bg-red-600 text-white w-8 h-8 rounded-lg flex items-center justify-center transition-colors"
+                >
+                  <StopIcon />
+                </button>
+              ) : (
+                <button
+                  onClick={sendMessage}
+                  disabled={!input.trim()}
+                  className="shrink-0 bg-orange-500 hover:bg-orange-600 disabled:bg-gray-700 disabled:text-gray-500 text-white w-8 h-8 rounded-lg flex items-center justify-center transition-colors"
+                >
+                  ↑
+                </button>
+              )}
             </div>
             <p className="text-gray-600 text-xs mt-2 text-center">
               Answers grounded in your uploaded files · Click [S1] tags to see exact sources
@@ -455,9 +822,9 @@ export default function ChatPage() {
                   <div className="mt-2 flex items-center gap-2">
                     <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
                       <div className="h-full bg-orange-500 rounded-full"
-                        style={{ width: `${Math.min(100, Math.round((selectedCitation.score||0)*100))}%` }} />
+                        style={{ width: `${Math.min(100, Math.round((selectedCitation.score || 0) * 100))}%` }} />
                     </div>
-                    <span className="text-gray-400 text-xs">{Math.min(100, Math.round((selectedCitation.score||0)*100))}%</span>
+                    <span className="text-gray-400 text-xs">{Math.min(100, Math.round((selectedCitation.score || 0) * 100))}%</span>
                   </div>
                 </div>
               )}
@@ -470,5 +837,33 @@ export default function ChatPage() {
         )}
       </div>
     </div>
+  )
+}
+
+// ── Inline SVG icons (no icon library needed) ──────────────────────────────────
+
+function CopyIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+    </svg>
+  )
+}
+
+function RegenerateIcon() {
+  return (
+    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+      <polyline points="1 4 1 10 7 10" />
+      <path d="M3.51 15a9 9 0 1 0 .49-3.5" />
+    </svg>
+  )
+}
+
+function StopIcon() {
+  return (
+    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
+      <rect x="3" y="3" width="18" height="18" rx="2" />
+    </svg>
   )
 }

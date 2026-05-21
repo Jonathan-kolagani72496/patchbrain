@@ -72,8 +72,14 @@ async def shutdown():
         await DB_POOL.close()
 
 def _sb() -> Client:
-    """Sync Supabase client — for auth + storage only."""
-    return create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_SERVICE_KEY"])
+    """Sync Supabase client — for auth + storage only. Singleton."""
+    return _SB_CLIENT
+
+# Module-level singleton — created once, reused on every request
+_SB_CLIENT: Client = create_client(
+    os.environ.get("SUPABASE_URL", ""),
+    os.environ.get("SUPABASE_SERVICE_KEY", ""),
+)
 
 ai   = AsyncOpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 ant  = anthropic.AsyncAnthropic(api_key=os.environ.get("ANTHROPIC_API_KEY"))
@@ -203,7 +209,7 @@ async def list_files(u=Depends(get_user)):
             return [dict(r) for r in rows]
     sb  = _sb()
     res = sb.table("files").select("*,file_versions(id,status,original_filename,size_bytes,created_at,error_message)")\
-          .eq("company_id",str(cid)).is_("deleted_at","null").order("created_at",desc=False).execute()
+          .eq("company_id",str(cid)).is_("deleted_at","null").order("created_at",desc=True).execute()
     return res.data
 
 class FileIdsBody(BaseModel):
@@ -621,7 +627,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
         yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
         try:
             async with ant.messages.stream(
-                model=os.environ.get("ANTHROPIC_MODEL", "claude-haiku-4-5-20251001"),
+                model="claude-sonnet-4-20250514",  # always Sonnet for Q&A
                 max_tokens=1024,
                 system=[{"type":"text","text":SYSTEM_PROMPT,
                          "cache_control":{"type":"ephemeral"}}],
@@ -687,10 +693,26 @@ async def health():
 async def list_conflicts(u=Depends(get_user)):
     cid = str(u["company_id"])
     sb = _sb()
-    rows = sb.table("detected_conflicts") \
+    rows = sb.table("data_conflicts") \
         .select("*") \
         .eq("company_id", cid) \
         .order("created_at", desc=False) \
         .limit(100) \
         .execute().data or []
     return rows
+class FollowUpBody(BaseModel):
+    question: str
+    answer: str
+
+@app.post("/suggest-followups")
+async def suggest_followups(b: FollowUpBody, u=Depends(get_user)):
+    try:
+        r = await ant.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=120,
+            messages=[{"role": "user", "content":
+                f"Given this Q&A about oilfield documents, suggest 3 short follow-up questions (max 8 words each). Return ONLY a JSON array of strings, nothing else.\n\nQ: {b.question}\nA: {b.answer[:400]}"}])
+        raw = r.content[0].text.strip().lstrip('```json').rstrip('```').strip()
+        suggestions = json.loads(raw)
+        return {"suggestions": suggestions[:3] if isinstance(suggestions, list) else []}
+    except Exception:
+        return {"suggestions": []}
