@@ -25,14 +25,21 @@ load_dotenv()
 
 app = FastAPI(title="PatchBrain API", version="3.0.0")
 
-FRONTEND_URL = os.environ.get("FRONTEND_URL", "")
+FRONTEND_URL = os.environ.get("FRONTEND_URL", "").rstrip("/")
+
+allowed_origins = [
+    "http://localhost:3000",
+    "https://patchbrain.vercel.app",
+    "https://patchbrain-dv999vhsf-jonathan-kolagani-s-projects.vercel.app",
+]
+
+if FRONTEND_URL:
+    allowed_origins.append(FRONTEND_URL)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:3000",
-        "https://patchbrain-dv999vhsf-jonathan-kolagani-s-projects.vercel.app",
-        "https://patchbrain.vercel.app",
-    ],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
