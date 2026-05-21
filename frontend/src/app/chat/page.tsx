@@ -722,7 +722,10 @@ export default function ChatPage() {
                 {followUps.map((q, i) => (
                   <button
                     key={i}
-                    onClick={() => { setFollowUps([]); setInput(q); setTimeout(sendMessage, 50) }}
+                    onClick={() => {
+                      setFollowUps([])
+                      sendMessageWithText(q)
+                    }}
                     className="text-xs text-gray-300 bg-gray-800 hover:bg-gray-700 border border-gray-700 hover:border-gray-600 rounded-full px-3 py-1.5 transition-colors"
                   >
                     {q} →

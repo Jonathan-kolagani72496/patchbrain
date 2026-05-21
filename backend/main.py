@@ -460,7 +460,7 @@ async def _maybe_summarize(sid: uuid.UUID, uid: uuid.UUID,
         return
     try:
         r = await ant.messages.create(
-            model="claude-haiku-4-5-20251001", max_tokens=300,
+            model=os.environ.get("ANTHROPIC_SUMMARY_MODEL", "claude-haiku-4-5-20251001"), max_tokens=300,
             messages=[{"role":"user","content":
                 f"Summarize this conversation in 150 words keeping all key facts and numbers:\n\n{history}"}])
         summ = r.content[0].text
@@ -627,7 +627,8 @@ async def ask(b: AskBody, u=Depends(get_user)):
         yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
         try:
             async with ant.messages.stream(
-                model="claude-sonnet-4-20250514",  # always Sonnet for Q&A
+                async with ant.messages.stream(
+                    model=os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),  # always Sonnet for Q&A
                 max_tokens=1024,
                 system=[{"type":"text","text":SYSTEM_PROMPT,
                          "cache_control":{"type":"ephemeral"}}],
