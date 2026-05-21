@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from openai import AsyncOpenAI
 import anthropic
+import httpx
 
 load_dotenv()
 
@@ -479,6 +480,238 @@ async def _maybe_summarize(sid: uuid.UUID, uid: uuid.UUID,
     except Exception as e:
         print(f"Summarize failed (non-critical): {e}")
 
+
+# ── Retrieval intelligence helpers ────────────────────────────────────────────
+
+FILE_INVENTORY_PATTERNS = (
+    "what files", "which files", "list files", "list my files",
+    "uploaded files", "documents do i have", "files do i have",
+    "files do i have access", "show files", "file library",
+)
+
+
+def _is_file_inventory_question(q: str) -> bool:
+    ql = " ".join(q.lower().replace("?", "").split())
+    return any(p in ql for p in FILE_INVENTORY_PATTERNS)
+
+
+def _format_bytes(n) -> str:
+    try:
+        n = int(n or 0)
+    except Exception:
+        return "unknown size"
+    if n <= 0:
+        return "unknown size"
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / 1024 / 1024:.1f} MB"
+
+
+async def _load_file_inventory(company_id: uuid.UUID) -> list[dict]:
+    """Load latest visible file version per file for direct file-list questions."""
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select
+                  f.id,
+                  f.logical_name,
+                  f.created_at,
+                  fv.id as file_version_id,
+                  fv.original_filename,
+                  fv.status,
+                  fv.size_bytes,
+                  fv.error_message,
+                  fv.created_at as version_created_at
+                from files f
+                left join lateral (
+                  select id, original_filename, status, size_bytes, error_message, created_at
+                  from file_versions
+                  where file_id = f.id
+                  order by created_at desc
+                  limit 1
+                ) fv on true
+                where f.company_id = $1
+                  and f.deleted_at is null
+                order by f.created_at desc
+                limit 100
+                """,
+                company_id,
+            )
+            return [dict(r) for r in rows]
+
+    sb = _sb()
+    data = (
+        sb.table("files")
+        .select("id,logical_name,created_at,file_versions(id,original_filename,status,size_bytes,error_message,created_at)")
+        .eq("company_id", str(company_id))
+        .is_("deleted_at", "null")
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+        .data
+        or []
+    )
+    out = []
+    for f in data:
+        versions = sorted(f.get("file_versions") or [], key=lambda x: x.get("created_at") or "", reverse=True)
+        v = versions[0] if versions else {}
+        out.append({
+            "id": f.get("id"),
+            "logical_name": f.get("logical_name"),
+            "created_at": f.get("created_at"),
+            "file_version_id": v.get("id"),
+            "original_filename": v.get("original_filename"),
+            "status": v.get("status"),
+            "size_bytes": v.get("size_bytes"),
+            "error_message": v.get("error_message"),
+            "version_created_at": v.get("created_at"),
+        })
+    return out
+
+
+def _build_file_inventory_answer(files: list[dict]) -> str:
+    if not files:
+        return "You do not have any uploaded files yet. Upload files from the dashboard first."
+
+    ready = sum(1 for f in files if f.get("status") == "ready")
+    processing = sum(1 for f in files if f.get("status") in {"uploaded", "queued", "parsing", "parsed", "chunking", "embedding"})
+    failed = sum(1 for f in files if f.get("status") == "failed")
+
+    lines = [
+        f"You currently have {len(files)} file{'s' if len(files) != 1 else ''} in your library: {ready} ready, {processing} processing, {failed} failed.",
+        "",
+    ]
+    for i, f in enumerate(files[:25], 1):
+        name = f.get("logical_name") or f.get("original_filename") or "Unnamed file"
+        status = f.get("status") or "unknown"
+        size = _format_bytes(f.get("size_bytes"))
+        err = f.get("error_message")
+        line = f"{i}. {name} — {status} — {size}"
+        if err and status == "failed":
+            line += f" — error: {str(err)[:160]}"
+        lines.append(line)
+
+    if len(files) > 25:
+        lines.append(f"\nShowing first 25 of {len(files)} files.")
+    return "\n".join(lines)
+
+
+async def _stream_direct_answer(sid: uuid.UUID, cid: uuid.UUID, uid: uuid.UUID, q: str,
+                                answer: str, new_count: int, history: str, srow: dict):
+    sids = str(sid)
+    yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
+    yield f"data: {json.dumps({'type':'token','text':answer})}\n\n"
+    yield f"data: {json.dumps({'type':'done','citations':[]})}\n\n"
+    asyncio.create_task(_save(sid, cid, uid, q, answer, [], new_count, history, srow, 0))
+
+
+def _chunk_doc_for_rerank(chunk: dict, filename: str) -> str:
+    parts = [
+        f"file: {filename}",
+        f"source_type: {chunk.get('source_type') or ''}",
+    ]
+    if chunk.get("page_number") is not None:
+        parts.append(f"page: {chunk.get('page_number')}")
+    if chunk.get("sheet_name"):
+        parts.append(f"sheet: {chunk.get('sheet_name')}")
+    if chunk.get("row_start") is not None or chunk.get("row_end") is not None:
+        parts.append(f"rows: {chunk.get('row_start')} - {chunk.get('row_end')}")
+    parts.append("content: |")
+    content = (chunk.get("content") or "")[:1800]
+    parts.append("  " + content.replace("\n", "\n  "))
+    return "\n".join(parts)
+
+
+async def _rerank_chunks(question: str, chunks: list[dict], fname_map: dict, top_n: int = 8) -> list[dict]:
+    """Cohere rerank with safe fallback to original retrieval order."""
+    api_key = os.environ.get("COHERE_API_KEY")
+    if not api_key or len(chunks) <= 1:
+        return chunks[:top_n]
+
+    docs = [
+        _chunk_doc_for_rerank(c, fname_map.get(c.get("file_version_id", ""), "unknown"))
+        for c in chunks
+    ]
+    payload = {
+        "model": os.environ.get("COHERE_RERANK_MODEL", "rerank-v3.5"),
+        "query": question,
+        "documents": docs,
+        "top_n": min(top_n, len(docs)),
+        "max_tokens_per_doc": int(os.environ.get("COHERE_RERANK_MAX_TOKENS_PER_DOC", "1200")),
+    }
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            r = await client.post(
+                "https://api.cohere.com/v2/rerank",
+                headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "X-Client-Name": "patchbrain",
+                },
+                json=payload,
+            )
+            r.raise_for_status()
+            data = r.json()
+
+        ranked = []
+        for item in data.get("results", []):
+            idx = item.get("index")
+            if isinstance(idx, int) and 0 <= idx < len(chunks):
+                c = dict(chunks[idx])
+                c["rerank_score"] = item.get("relevance_score")
+                ranked.append(c)
+        return ranked or chunks[:top_n]
+    except Exception as e:
+        print(f"Rerank failed; using hybrid_search order: {e}")
+        return chunks[:top_n]
+
+
+def _evidence_is_too_weak(chunks: list[dict]) -> bool:
+    if not chunks:
+        return True
+    top = chunks[0]
+    try:
+        combined = float(top.get("combined_score") or 0)
+    except Exception:
+        combined = 0.0
+    try:
+        text_score = float(top.get("text_score") or 0)
+    except Exception:
+        text_score = 0.0
+    rerank_score = top.get("rerank_score")
+
+    # Conservative defaults; tune with real logs. Set env vars lower/higher after testing.
+    min_combined = float(os.environ.get("RETRIEVAL_MIN_COMBINED_SCORE", "0.05"))
+    min_rerank = float(os.environ.get("COHERE_RERANK_MIN_SCORE", "0.05"))
+
+    if rerank_score is not None:
+        try:
+            return float(rerank_score) < min_rerank
+        except Exception:
+            return False
+
+    return combined < min_combined and text_score <= 0
+
+
+def _log_retrieval(question: str, chunks: list[dict], fname_map: dict):
+    try:
+        rows = []
+        for c in chunks[:5]:
+            rows.append({
+                "file": fname_map.get(c.get("file_version_id", ""), "unknown"),
+                "combined": c.get("combined_score"),
+                "vector": c.get("vector_score"),
+                "text": c.get("text_score"),
+                "rerank": c.get("rerank_score"),
+                "source": c.get("source_type"),
+            })
+        print("retrieval_debug", json.dumps({"question": question[:120], "top": rows}, default=str))
+    except Exception:
+        pass
+
 # ── /ask  (streaming) ──────────────────────────────────────────────────────────
 
 class AskBody(BaseModel):
@@ -561,6 +794,17 @@ async def ask(b: AskBody, u=Depends(get_user)):
         ))
     history = _build_context(srow, recent)
     new_count = (srow.get("message_count") or 0) + 2
+
+    # Direct tool answer: file inventory questions should not go through RAG/Claude.
+    if _is_file_inventory_question(q):
+        files = await _load_file_inventory(cid)
+        answer = _build_file_inventory_answer(files)
+        return StreamingResponse(
+            _stream_direct_answer(sid, cid, uid, q, answer, new_count, history, srow),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"},
+        )
+
     # Embed
     try:
         emb = await ai.embeddings.create(model="text-embedding-3-small", input=q)
@@ -579,7 +823,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
             "p_company_id": str(cid),
             "p_query_embedding": query_embedding,
             "p_query_text": q,
-            "p_match_count": 10,
+            "p_match_count": 20,
         })
         .execute()
         .data
@@ -599,6 +843,18 @@ async def ask(b: AskBody, u=Depends(get_user)):
             for r in (sb.table("file_versions").select("id,original_filename").in_("id",fv_ids).execute().data or []):
                 fname_map[r["id"]] = r["original_filename"]
 
+    # Rerank: first-stage retrieval gets 20 candidates, second-stage picks best 8.
+    chunks = await _rerank_chunks(q, chunks, fname_map, top_n=8)
+    _log_retrieval(q, chunks, fname_map)
+
+    if _evidence_is_too_weak(chunks):
+        async def weak_evidence():
+            yield f"data: {json.dumps({'type':'session','session_id':sids})}\n\n"
+            msg = "I don't have enough information in the uploaded files to answer that confidently."
+            yield f"data: {json.dumps({'type':'token','text':msg})}\n\n"
+            yield f"data: {json.dumps({'type':'done','citations':[]})}\n\n"
+        return StreamingResponse(weak_evidence(), media_type="text/event-stream")
+
     # Source blocks
     src_blocks = []
     citations  = []
@@ -615,7 +871,7 @@ async def ask(b: AskBody, u=Depends(get_user)):
             "page_number":chunk.get("page_number"),"sheet_name":chunk.get("sheet_name"),
             "row_start":chunk.get("row_start"),"row_end":chunk.get("row_end"),
             "filename":fname,"preview":(chunk.get("content") or "")[:300],
-            "score":chunk.get("combined_score")})
+            "score":chunk.get("combined_score"),"rerank_score":chunk.get("rerank_score")})
 
     if not chunks:
         async def no_data():
