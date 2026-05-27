@@ -5,6 +5,7 @@ streaming Claude responses, smart context window, parallel DB calls.
 """
 
 import os
+import re
 import uuid
 import json
 import asyncio
@@ -537,6 +538,211 @@ async def _maybe_summarize(sid: uuid.UUID, uid: uuid.UUID,
 
 
 # ── Retrieval intelligence helpers ────────────────────────────────────────────
+
+
+DETERMINISTIC_COUNT_PATTERNS = (
+    "how many times", "count the word", "count word", "count phrase",
+    "how often", "number of times", "appears", "appeared", "occur", "occurs",
+)
+
+DETERMINISTIC_MENTION_PATTERNS = (
+    "which files mention", "what files mention", "files mention",
+    "which documents mention", "what documents mention", "documents mention",
+    "search for", "find exact", "exact phrase",
+)
+
+
+def _extract_quoted_phrase(q: str) -> str | None:
+    patterns = [
+        r'"([^"]+)"',
+        r"'([^']+)'",
+        r"“([^”]+)”",
+        r"‘([^’]+)’",
+    ]
+    for pat in patterns:
+        m = re.search(pat, q)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+    return None
+
+
+def _extract_after_phrase(q: str, markers: tuple[str, ...]) -> str | None:
+    q_clean = q.strip().rstrip("?")
+    q_lower = q_clean.lower()
+    for marker_text in markers:
+        idx = q_lower.find(marker_text)
+        if idx >= 0:
+            val = q_clean[idx + len(marker_text):].strip(" :,-")
+            if val:
+                val = re.sub(r"\s+(across|in)\s+(all\s+)?(my\s+)?(files|documents)$", "", val, flags=re.I).strip()
+                return val.strip('"').strip("'").strip()
+    return None
+
+
+def _detect_deterministic_tool_intent(q: str) -> tuple[str, str] | None:
+    ql = _normalize_question(q) if "_normalize_question" in globals() else " ".join(q.lower().replace("?", "").split())
+
+    quoted = _extract_quoted_phrase(q)
+
+    if any(p in ql for p in DETERMINISTIC_COUNT_PATTERNS):
+        term = quoted or _extract_after_phrase(q, (
+            "how many times does", "how many times did", "how many times has",
+            "count the word", "count word", "count phrase", "how often does",
+        ))
+        if term:
+            term = re.sub(r"\b(appear|appears|appeared|occur|occurs)\b.*$", "", term, flags=re.I).strip()
+            term = re.sub(r"^\b(the word|word|phrase)\b", "", term, flags=re.I).strip()
+            if term:
+                return ("exact_count", term)
+
+    if any(p in ql for p in DETERMINISTIC_MENTION_PATTERNS):
+        term = quoted or _extract_after_phrase(q, (
+            "which files mention", "what files mention", "files mention",
+            "which documents mention", "what documents mention", "documents mention",
+            "search for", "find exact", "exact phrase",
+        ))
+        if term:
+            return ("files_mentioning", term)
+
+    return None
+
+
+def _safe_sql_like_pattern(term: str) -> str:
+    term = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{term}%"
+
+
+def _count_term_in_text(text: str, term: str) -> int:
+    if not text or not term:
+        return 0
+
+    if re.fullmatch(r"[A-Za-z0-9_-]+", term):
+        return len(re.findall(rf"(?<![A-Za-z0-9_-]){re.escape(term)}(?![A-Za-z0-9_-])", text, flags=re.I))
+
+    return len(re.findall(re.escape(term), text, flags=re.I))
+
+
+async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 1000) -> list[dict]:
+    pattern = _safe_sql_like_pattern(term)
+    rows = await q("""
+        select
+          fc.id as chunk_id,
+          fc.content,
+          fc.file_id,
+          fc.file_version_id,
+          fc.source_type,
+          fc.page_number,
+          fc.sheet_name,
+          fc.row_start,
+          fc.row_end,
+          f.logical_name,
+          fv.original_filename,
+          fv.status
+        from file_chunks fc
+        join file_versions fv on fv.id = fc.file_version_id
+        join files f on f.id = fc.file_id
+        where fc.company_id = $1
+          and fv.status = 'ready'
+          and f.deleted_at is null
+          and fc.content ilike $2
+        order by fv.created_at desc, fc.chunk_index asc
+        limit $3
+    """, company_id, pattern, limit)
+    return [dict(r) for r in rows]
+
+
+def _build_exact_count_answer(term: str, rows: list[dict]) -> str:
+    if not rows:
+        return f'I found 0 occurrences of "{term}" in ready uploaded files.'
+
+    by_file: dict[str, dict] = {}
+    total = 0
+
+    for row in rows:
+        count = _count_term_in_text(row.get("content") or "", term)
+        if count <= 0:
+            continue
+        filename = row.get("logical_name") or row.get("original_filename") or "Unnamed file"
+        item = by_file.setdefault(filename, {"count": 0, "chunks": 0})
+        item["count"] += count
+        item["chunks"] += 1
+        total += count
+
+    if total == 0:
+        return f'I found 0 exact occurrences of "{term}" in ready uploaded files.'
+
+    lines = [
+        f'I found {total} occurrence{"s" if total != 1 else ""} of "{term}" across {len(by_file)} ready file{"s" if len(by_file) != 1 else ""}.',
+        "",
+    ]
+
+    for i, (filename, info) in enumerate(sorted(by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
+        lines.append(f"{i}. {filename} — {info['count']} occurrence{'s' if info['count'] != 1 else ''} in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}")
+
+    if len(rows) >= 1000:
+        lines.append("\nNote: count may be incomplete because the result limit was reached.")
+    return "\n".join(lines)
+
+
+def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
+    if not rows:
+        return f'I found no ready uploaded files mentioning "{term}".'
+
+    by_file: dict[str, dict] = {}
+
+    for row in rows:
+        filename = row.get("logical_name") or row.get("original_filename") or "Unnamed file"
+        count = _count_term_in_text(row.get("content") or "", term)
+        info = by_file.setdefault(filename, {
+            "matches": 0,
+            "chunks": 0,
+            "examples": [],
+        })
+        info["matches"] += max(count, 1)
+        info["chunks"] += 1
+
+        if len(info["examples"]) < 2:
+            loc_parts = []
+            if row.get("page_number") is not None:
+                loc_parts.append(f"page {row.get('page_number')}")
+            if row.get("sheet_name"):
+                loc_parts.append(f"sheet {row.get('sheet_name')}")
+            if row.get("row_start") is not None or row.get("row_end") is not None:
+                loc_parts.append(f"rows {row.get('row_start')}-{row.get('row_end')}")
+            loc = ", ".join(loc_parts) if loc_parts else row.get("source_type") or "source chunk"
+            snippet = (row.get("content") or "").replace("\n", " ")
+            idx = snippet.lower().find(term.lower())
+            if idx >= 0:
+                start = max(0, idx - 80)
+                end = min(len(snippet), idx + len(term) + 80)
+                snippet = snippet[start:end]
+            else:
+                snippet = snippet[:180]
+            info["examples"].append(f"{loc}: {snippet[:220]}")
+
+    lines = [
+        f'I found {len(by_file)} ready file{"s" if len(by_file) != 1 else ""} mentioning "{term}".',
+        "",
+    ]
+
+    for i, (filename, info) in enumerate(sorted(by_file.items(), key=lambda x: x[1]["matches"], reverse=True), 1):
+        lines.append(f"{i}. {filename} — {info['matches']} match{'es' if info['matches'] != 1 else ''} across {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}")
+        for ex in info["examples"]:
+            lines.append(f"   - {ex}")
+
+    if len(rows) >= 1000:
+        lines.append("\nNote: search may be incomplete because the result limit was reached.")
+    return "\n".join(lines)
+
+
+async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) -> str:
+    rows = await _load_chunks_matching_term(company_id, term)
+    if tool_name == "exact_count":
+        return _build_exact_count_answer(term, rows)
+    if tool_name == "files_mentioning":
+        return _build_files_mentioning_answer(term, rows)
+    return "I could not route that tool request."
+
 
 FILE_INVENTORY_PATTERNS = (
     "what files", "list files", "list my files",
@@ -1071,6 +1277,20 @@ async def ask(b: AskBody, u=Depends(get_user)):
             _stream_direct_answer(
                 sid, cid, uid, q, answer, new_count, history, srow, started_at,
                 intent_type=file_status_intent,
+            ),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"},
+        )
+
+    # Deterministic tools: exact counts/searches should use SQL/Python, not Claude.
+    deterministic_intent = _detect_deterministic_tool_intent(q)
+    if deterministic_intent:
+        tool_name, term = deterministic_intent
+        answer = await _run_deterministic_tool(cid, tool_name, term)
+        return StreamingResponse(
+            _stream_direct_answer(
+                sid, cid, uid, q, answer, new_count, history, srow, started_at,
+                intent_type=tool_name,
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"},
