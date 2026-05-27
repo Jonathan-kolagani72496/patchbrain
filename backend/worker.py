@@ -27,6 +27,7 @@ import anthropic
 # Parsers
 from parsers.pdf_parser import parse_pdf
 from parsers.excel_parser import parse_excel
+from parsers.csv_parser import parse_csv
 from parsers.docx_parser import parse_docx
 from parsers.whatsapp_parser import parse_whatsapp
 
@@ -344,6 +345,9 @@ def parse_file(local_path: str, original_filename: str, mime_type: str) -> list[
 
     if ext == ".docx" or "wordprocessingml" in mime_type:
         return parse_docx(local_path)
+
+    if ext == ".csv" or "text/csv" in mime_type or "csv" in mime_type:
+        return parse_csv(local_path)
 
     if ext == ".txt" or mime_type == "text/plain":
         with open(local_path, "r", encoding="utf-8", errors="replace") as f:
