@@ -1262,6 +1262,146 @@ async def _save(sid, cid, uid, q, answer, citations, count, history, srow, token
     except Exception as e:
         print(f"_save error: {e}")
 
+# ── Evidence viewer ───────────────────────────────────────────────────────────
+
+@app.get("/chunks/{chunk_id}")
+async def get_chunk_evidence(chunk_id: str, u=Depends(get_user)):
+    """Return the full source chunk behind a citation.
+
+    Company-scoped: users can only read chunks that belong to their company.
+    This endpoint returns original `file_chunks.content`, not generated embedding text.
+    """
+    try:
+        chunk_uuid = uuid.UUID(chunk_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid chunk_id")
+
+    cid = uuid.UUID(str(u["company_id"]))
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            row = await c.fetchrow(
+                """
+                select
+                    fc.id as chunk_id,
+                    fc.company_id,
+                    fc.file_id,
+                    fc.file_version_id,
+                    fc.chunk_index,
+                    fc.content,
+                    fc.source_type,
+                    fc.page_number,
+                    fc.sheet_name,
+                    fc.row_start,
+                    fc.row_end,
+                    fc.metadata_jsonb,
+                    fc.token_count,
+                    fc.contextual_summary,
+                    fc.contextualized_at,
+                    f.logical_name,
+                    fv.original_filename,
+                    fv.status as file_status,
+                    fv.created_at as file_version_created_at
+                from file_chunks fc
+                join file_versions fv on fv.id = fc.file_version_id
+                join files f on f.id = fc.file_id
+                where fc.id = $1
+                  and fc.company_id = $2
+                  and fv.company_id = $2
+                  and f.company_id = $2
+                  and f.deleted_at is null
+                limit 1
+                """,
+                chunk_uuid,
+                cid,
+            )
+            if not row:
+                raise HTTPException(404, "Chunk not found")
+
+            d = dict(row)
+            return {
+                "chunk_id": str(d["chunk_id"]),
+                "company_id": str(d["company_id"]),
+                "file_id": str(d["file_id"]),
+                "file_version_id": str(d["file_version_id"]),
+                "chunk_index": d.get("chunk_index"),
+                "filename": d.get("original_filename") or d.get("logical_name"),
+                "logical_name": d.get("logical_name"),
+                "original_filename": d.get("original_filename"),
+                "file_status": d.get("file_status"),
+                "source_type": d.get("source_type"),
+                "page_number": d.get("page_number"),
+                "sheet_name": d.get("sheet_name"),
+                "row_start": d.get("row_start"),
+                "row_end": d.get("row_end"),
+                "metadata_jsonb": d.get("metadata_jsonb") or {},
+                "token_count": d.get("token_count"),
+                "content": d.get("content") or "",
+                "contextual_summary": d.get("contextual_summary"),
+                "contextualized_at": d.get("contextualized_at").isoformat() if d.get("contextualized_at") else None,
+                "file_version_created_at": d.get("file_version_created_at").isoformat() if d.get("file_version_created_at") else None,
+            }
+
+    sb = _sb()
+    chunk = (
+        sb.table("file_chunks")
+        .select("*")
+        .eq("id", str(chunk_uuid))
+        .eq("company_id", str(cid))
+        .single()
+        .execute()
+        .data
+    )
+    if not chunk:
+        raise HTTPException(404, "Chunk not found")
+
+    file_row = (
+        sb.table("files")
+        .select("id,logical_name,deleted_at")
+        .eq("id", chunk["file_id"])
+        .eq("company_id", str(cid))
+        .single()
+        .execute()
+        .data
+    )
+    if not file_row or file_row.get("deleted_at") is not None:
+        raise HTTPException(404, "Chunk not found")
+
+    version_row = (
+        sb.table("file_versions")
+        .select("id,original_filename,status,created_at")
+        .eq("id", chunk["file_version_id"])
+        .eq("company_id", str(cid))
+        .single()
+        .execute()
+        .data
+        or {}
+    )
+
+    return {
+        "chunk_id": chunk["id"],
+        "company_id": chunk["company_id"],
+        "file_id": chunk["file_id"],
+        "file_version_id": chunk["file_version_id"],
+        "chunk_index": chunk.get("chunk_index"),
+        "filename": version_row.get("original_filename") or file_row.get("logical_name"),
+        "logical_name": file_row.get("logical_name"),
+        "original_filename": version_row.get("original_filename"),
+        "file_status": version_row.get("status"),
+        "source_type": chunk.get("source_type"),
+        "page_number": chunk.get("page_number"),
+        "sheet_name": chunk.get("sheet_name"),
+        "row_start": chunk.get("row_start"),
+        "row_end": chunk.get("row_end"),
+        "metadata_jsonb": chunk.get("metadata_jsonb") or {},
+        "token_count": chunk.get("token_count"),
+        "content": chunk.get("content") or "",
+        "contextual_summary": chunk.get("contextual_summary"),
+        "contextualized_at": chunk.get("contextualized_at"),
+        "file_version_created_at": version_row.get("created_at"),
+    }
+
+
 @app.get("/health")
 async def health():
     return {"status":"ok","version":"3.0.0","pool": DB_POOL is not None}
@@ -1309,7 +1449,7 @@ async def list_conflicts(u=Depends(get_user)):
     rows = sb.table("data_conflicts") \
         .select("*") \
         .eq("company_id", cid) \
-        .order("created_at", desc=False) \
+        .order("created_at", desc=True) \
         .limit(100) \
         .execute().data or []
     return rows
