@@ -625,34 +625,39 @@ def _count_term_in_text(text: str, term: str) -> int:
 async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 1000) -> list[dict]:
     """Load chunks that contain an exact term/phrase.
 
-    Keep this query conservative: only use columns known to exist in the core
-    schema. Do not depend on files.logical_name because older schemas may not
-    have it.
+    Uses the existing asyncpg DB_POOL directly. Do not call q(...); this backend
+    does not define that helper.
     """
+    if not DB_POOL:
+        raise RuntimeError("DB_POOL is not available; deterministic tools require the async database pool")
+
     pattern = _safe_sql_like_pattern(term)
-    rows = await q("""
-        select
-          fc.id as chunk_id,
-          fc.content,
-          fc.file_id,
-          fc.file_version_id,
-          fc.source_type,
-          fc.page_number,
-          fc.sheet_name,
-          fc.row_start,
-          fc.row_end,
-          fv.original_filename,
-          fv.status
-        from file_chunks fc
-        join file_versions fv on fv.id = fc.file_version_id
-        join files f on f.id = fc.file_id
-        where fc.company_id = $1
-          and fv.status = 'ready'
-          and f.deleted_at is null
-          and fc.content ilike $2
-        order by fv.created_at desc, fc.chunk_index asc
-        limit $3
-    """, company_id, pattern, limit)
+
+    async with DB_POOL.acquire() as c:
+        rows = await c.fetch("""
+            select
+              fc.id as chunk_id,
+              fc.content,
+              fc.file_id,
+              fc.file_version_id,
+              fc.source_type,
+              fc.page_number,
+              fc.sheet_name,
+              fc.row_start,
+              fc.row_end,
+              fv.original_filename,
+              fv.status
+            from file_chunks fc
+            join file_versions fv on fv.id = fc.file_version_id
+            join files f on f.id = fc.file_id
+            where fc.company_id = $1
+              and fv.status = 'ready'
+              and f.deleted_at is null
+              and fc.content ilike $2
+            order by fv.created_at desc, fc.chunk_index asc
+            limit $3
+        """, uuid.UUID(str(company_id)), pattern, limit)
+
     return [dict(r) for r in rows]
 
 
