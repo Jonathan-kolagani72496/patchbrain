@@ -33,7 +33,7 @@ app = FastAPI(title="PatchBrain API", version="3.0.0")
 async def debug_version():
     return {
         "app": "patchbrain-api",
-        "deterministic_version": "v5-count-search-fix",
+        "deterministic_version": "v6-count-search-fix",
         "message": "If you see this, Render is running the updated backend/main.py"
     }
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "").rstrip("/")
@@ -799,70 +799,83 @@ async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 10
 
 
 def _build_exact_count_answer(term: str, rows: list[dict]) -> str:
+    MARKER = "[deterministic-v6]"
+
     if not rows:
-        return f'[deterministic-v4] I found 0 occurrences of "{term}" in ready uploaded files.'
+        return f'{MARKER} I found 0 occurrences of "{term}" in ready uploaded files.'
 
     whole_by_file: dict[str, dict] = {}
-    sub_by_file: dict[str, dict] = {}
-
+    sub_by_file:   dict[str, dict] = {}
     whole_total = 0
-    sub_total = 0
+    sub_total   = 0
 
     for row in rows:
-        content = row.get("content") or ""
-        whole_count = _count_whole_word(content, term)
-        substring_count = _count_substring(content, term)
-
+        content  = row.get("content") or ""
         filename = row.get("original_filename") or "Unnamed file"
 
-        if substring_count > 0:
+        wc = _count_whole_word(content, term)
+        sc = _count_substring(content, term)
+
+        if sc > 0:
             item = sub_by_file.setdefault(filename, {"count": 0, "chunks": 0})
-            item["count"] += substring_count
+            item["count"]  += sc
             item["chunks"] += 1
-            sub_total += substring_count
+            sub_total      += sc
 
-        if whole_count > 0:
+        if wc > 0:
             item = whole_by_file.setdefault(filename, {"count": 0, "chunks": 0})
-            item["count"] += whole_count
+            item["count"]  += wc
             item["chunks"] += 1
-            whole_total += whole_count
+            whole_total    += wc
 
+    # ── Whole-word hits ───────────────────────────────────────────────────────
     if whole_total > 0:
         lines = [
-            f'I found {whole_total} standalone occurrence{"s" if whole_total != 1 else ""} of "{term}" across {len(whole_by_file)} ready file{"s" if len(whole_by_file) != 1 else ""}.',
+            f'{MARKER} I found {whole_total} standalone occurrence{"s" if whole_total != 1 else ""} of '
+            f'"{term}" across {len(whole_by_file)} ready file{"s" if len(whole_by_file) != 1 else ""}.',
             "",
         ]
-
-        for i, (filename, info) in enumerate(sorted(whole_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
+        for i, (fn, info) in enumerate(
+            sorted(whole_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1
+        ):
             lines.append(
-                f"{i}. {filename} — {info['count']} standalone occurrence{'s' if info['count'] != 1 else ''} "
+                f"{i}. {fn} — {info['count']} standalone occurrence{'s' if info['count'] != 1 else ''} "
                 f"in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}"
             )
-
-        if sub_total > whole_total:
-            lines.append("")
-            lines.append(
-                f'Note: "{term}" also appears {sub_total - whole_total} additional time{"s" if (sub_total - whole_total) != 1 else ""} as part of longer terms.'
-            )
-
+        extra = sub_total - whole_total
+        if extra > 0:
+            lines += [
+                "",
+                f'Note: "{term}" also appears {extra} additional time{"s" if extra != 1 else ""} as part of longer terms.',
+            ]
         return "\n".join(lines)
 
+    # ── Substring-only hits ───────────────────────────────────────────────────
     if sub_total > 0:
         lines = [
-            f'I found 0 standalone occurrences of "{term}", but {sub_total} substring match{"es" if sub_total != 1 else ""} across {len(sub_by_file)} ready file{"s" if len(sub_by_file) != 1 else ""}.',
+            f'{MARKER} I found 0 standalone occurrences of "{term}", but {sub_total} '
+            f'substring match{"es" if sub_total != 1 else ""} across {len(sub_by_file)} '
+            f'ready file{"s" if len(sub_by_file) != 1 else ""}.',
             "",
         ]
-
-        for i, (filename, info) in enumerate(sorted(sub_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
+        for i, (fn, info) in enumerate(
+            sorted(sub_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1
+        ):
             lines.append(
-                f"{i}. {filename} — {info['count']} substring match{'es' if info['count'] != 1 else ''} "
+                f"{i}. {fn} — {info['count']} substring match{'es' if info['count'] != 1 else ''} "
                 f"in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}"
             )
-
         return "\n".join(lines)
 
-    return f'I found 0 occurrences of "{term}" in ready uploaded files.'
-
+    # ── DB returned rows but Python found zero matches ────────────────────────
+    # This means Postgres ilike matched but Python regex didn't. Log it and
+    # report the raw chunk count so the user isn't silently lied to.
+    print(f"[v6 DEBUG] ilike returned {len(rows)} rows but Python found 0 matches for {term!r}")
+    return (
+        f'{MARKER} Postgres found {len(rows)} chunk{"s" if len(rows) != 1 else ""} containing '
+        f'"{term}" but the in-memory count came back 0 — likely an encoding mismatch. '
+        f'Try rephrasing or ask me to summarize documents mentioning "{term}" instead.'
+    )
 def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
     if not rows:
         return f'I found no ready uploaded files mentioning "{term}".'
@@ -903,7 +916,7 @@ def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
             info["examples"].append(f"{loc}: {snippet[:220]}")
 
     lines = [
-    f'[deterministic-v4] I found {len(by_file)} ready file{"s" if len(by_file) != 1 else ""} mentioning "{term}".',
+    f'[deterministic-v6] I found {len(by_file)} ready file{"s" if len(by_file) != 1 else ""} mentioning "{term}".',
     "",
     ]
 
