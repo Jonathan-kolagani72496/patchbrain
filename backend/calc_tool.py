@@ -12,7 +12,7 @@ import re
 import uuid
 from typing import Any
 
-VERSION_MARKER = "[structured-calc-v2]"
+VERSION_MARKER = "[structured-calc-v3]"
 TABLE_SOURCE_TYPES = ("csv_rows", "sheet_rows")
 
 FIELD_ALIASES: dict[str, str] = {
@@ -46,9 +46,12 @@ GROUP_FIELD_PRIORITY = {
 }
 
 CALC_SUM_PATTERNS = (
-    "total revenue", "total amount", "total bbls", "total barrels", "how much revenue",
-    "how much did", "how much was", "how much were", "sum of", "total hauled",
-    "total disposed", "total injected", "total invoice", "total billed", "invoice breakdown",
+    "total revenue", "total amount", "total bbls", "total barrels",
+    "how many bbls", "how many barrels", "how many bbl", "how many barrel",
+    "bbls were hauled", "barrels were hauled", "bbls hauled", "barrels hauled",
+    "how much revenue", "how much did", "how much was", "how much were",
+    "sum of", "total hauled", "total disposed", "total injected",
+    "total invoice", "total billed", "invoice breakdown",
 )
 CALC_COUNT_PATTERNS = (
     "how many runs", "how many tickets", "how many loads", "how many trips", "how many hauls",
@@ -193,12 +196,21 @@ def _resolve_group_field(q: str, records: list[dict]) -> str | None:
 
 def _calc_intent(q: str) -> str:
     ql = (q or "").lower()
+
     if any(p in ql for p in CALC_RANK_PATTERNS):
         return "rank"
     if any(p in ql for p in CALC_AVG_PATTERNS):
         return "avg"
+
+    # "How many barrels/bbls" means sum the volume field, not count rows.
+    if re.search(r"how\s+many\s+(bbls?|barrels?)", ql):
+        return "sum"
+    if re.search(r"(bbls?|barrels?)\s+(were\s+)?hauled", ql):
+        return "sum"
+
     if any(p in ql for p in CALC_COUNT_PATTERNS):
         return "count"
+
     return "sum"
 
 
@@ -227,6 +239,7 @@ def _run_calc(q: str, records: list[dict], entity: str | None, numeric_field: st
     filtered = [r for r in records if _record_matches_entity(r, entity)] if entity else records
     if entity and not filtered:
         return f'{VERSION_MARKER} No rows matched "{entity}" in structured table data. Searched {len(records)} parsed rows.'
+    filtered = _filter_records_for_requested_shape(q, filtered, numeric_field, group_field, entity)
     total_rows = len(filtered)
 
     if intent == "rank" or (not entity and group_field):
@@ -245,8 +258,13 @@ def _run_calc(q: str, records: list[dict], entity: str | None, numeric_field: st
         groups_num: dict[str, float] = {}
         groups_cnt: dict[str, int] = {}
         examples: dict[str, list[str]] = {}
+        excluded_unknown = 0
         for r in filtered:
-            key = str(r.get(gf) or "Unknown")
+            raw_key = r.get(gf)
+            if _is_unknown_group_value(raw_key):
+                excluded_unknown += 1
+                continue
+            key = str(raw_key).strip()
             val = _to_float(r.get(numeric_field))
             if val is None:
                 continue
@@ -280,9 +298,9 @@ def _run_calc(q: str, records: list[dict], entity: str | None, numeric_field: st
     entity_clause = f' for "{entity}"' if entity else ""
     if intent == "avg":
         avg = total / len(values)
-        lines = [f"{VERSION_MARKER} Average {numeric_field}{entity_clause}: {_format_value(numeric_field, avg)}", f"Based on {len(values)} numeric row{'s' if len(values) != 1 else ''}; total {_format_value(numeric_field, total)}."]
+        lines = [f"{VERSION_MARKER} Average {_friendly_field_name(numeric_field)}{entity_clause}: {_format_value(numeric_field, avg)}", f"Based on {len(values)} numeric row{'s' if len(values) != 1 else ''}; total {_format_value(numeric_field, total)}."]
     else:
-        lines = [f"{VERSION_MARKER} Total {numeric_field}{entity_clause}: {_format_value(numeric_field, total)}", f"Based on {len(values)} numeric row{'s' if len(values) != 1 else ''}."]
+        lines = [f"{VERSION_MARKER} Total {_friendly_field_name(numeric_field)}{entity_clause}: {_format_value(numeric_field, total)}", f"Based on {len(values)} numeric row{'s' if len(values) != 1 else ''}."]
     examples = ", ".join(_source_label(r) for _, r in values[:10])
     if examples:
         lines.append("Source rows: " + examples + ("…" if len(values) > 10 else ""))
@@ -363,5 +381,19 @@ async def run_structured_calc(question: str, company_id: str, db_pool, sb_client
 
 
 def detect_calc_intent(q: str) -> bool:
-    ql = " ".join((q or "").lower().replace("?", "").replace("'", "").split())
-    return any(p in ql for p in ALL_CALC_PATTERNS)
+    raw = (q or "").lower().replace("?", "").replace("'", "")
+    ql = " ".join(raw.split())
+
+    if any(p in ql for p in ALL_CALC_PATTERNS):
+        return True
+
+    if re.search(r"how\s+many\s+(bbls?|barrels?)", ql):
+        return True
+    if re.search(r"(bbls?|barrels?)\s+(were\s+)?hauled", ql):
+        return True
+    if re.search(r"(highest|lowest|most|least).*(revenue|amount|bbls?|barrels?)", ql):
+        return True
+    if re.search(r"(total|sum).*(revenue|amount|bbls?|barrels?)", ql):
+        return True
+
+    return False
