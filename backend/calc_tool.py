@@ -12,7 +12,7 @@ import re
 import uuid
 from typing import Any
 
-VERSION_MARKER = "[structured-calc-v3]"
+VERSION_MARKER = "[structured-calc-v3.1]"
 TABLE_SOURCE_TYPES = ("csv_rows", "sheet_rows")
 
 FIELD_ALIASES: dict[str, str] = {
@@ -225,6 +225,80 @@ def _source_label(record: dict[str, Any]) -> str:
             bits.append(f"{f}={record[f]}")
             break
     return " — ".join(bits) if bits else "source row"
+
+
+
+def _is_unknown_group_value(value: Any) -> bool:
+    s = str(value or "").strip().lower()
+    return s in {"", "unknown", "none", "null", "n/a", "na", "-", "--"}
+
+
+def _record_has_field_value(record: dict[str, Any], field: str) -> bool:
+    if not field:
+        return False
+    return not _is_unknown_group_value(record.get(field))
+
+
+def _filter_records_for_requested_shape(
+    q: str,
+    records: list[dict],
+    numeric_field: str | None,
+    group_field: str | None,
+    entity: str | None,
+) -> list[dict]:
+    """Avoid mixing unrelated table rows when answering grouped math.
+
+    Examples:
+    - client ranking should exclude invoice rows that have total_amount but no client
+    - lease ranking should exclude tables that have no lease/location field
+    - run/load questions should prefer ticket/run rows
+    """
+    ql = (q or "").lower()
+    filtered = records
+
+    if group_field:
+        filtered = [r for r in filtered if _record_has_field_value(r, group_field)]
+
+    if numeric_field:
+        filtered = [r for r in filtered if _to_float(r.get(numeric_field)) is not None]
+
+    if any(w in ql for w in ("run", "runs", "ticket", "tickets", "load", "loads", "haul", "hauled", "truck", "driver")):
+        preferred = [
+            r for r in filtered
+            if any(k in r for k in ("ticket_id", "truck_id", "driver", "lease_location", "bbls_hauled"))
+        ]
+        if preferred:
+            filtered = preferred
+
+    if any(w in ql for w in ("client", "customer")):
+        preferred = [
+            r for r in filtered
+            if any(_record_has_field_value(r, f) for f in ("client", "customer"))
+        ]
+        if preferred:
+            filtered = preferred
+
+    if any(w in ql for w in ("lease", "site", "well", "location")):
+        preferred = [
+            r for r in filtered
+            if any(_record_has_field_value(r, f) for f in ("lease_location", "lease_origin", "lease", "well", "site", "location"))
+        ]
+        if preferred:
+            filtered = preferred
+
+    return filtered or records
+
+
+def _friendly_field_name(field: str | None) -> str:
+    mapping = {
+        "total_amount": "revenue",
+        "bbls_hauled": "barrels hauled",
+        "bbls_received": "barrels received",
+        "total_bbls": "total barrels",
+        "rate_per_bbl": "rate per barrel",
+    }
+    return mapping.get(field or "", field or "value")
+
 
 
 def _format_value(field: str, value: float) -> str:

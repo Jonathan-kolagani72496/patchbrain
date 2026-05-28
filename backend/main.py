@@ -34,7 +34,7 @@ app = FastAPI(title="PatchBrain API", version="3.0.0")
 async def debug_version():
     return {
         "app": "patchbrain-api",
-        "deterministic_version": "v8-structured-calc-v3",
+        "deterministic_version": "v9-structured-calc-v3.1",
         "message": "If you see this, Render is running the updated backend/main.py"
     }
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "").rstrip("/")
@@ -961,7 +961,7 @@ async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) ->
 
         if tool_name == "structured_calc":
             return (
-                "[structured-calc-v3] I could not complete that calculation because the backend hit an internal error. "
+                "[structured-calc-v3.1] I could not complete that calculation because the backend hit an internal error. "
                 "The normal document search still works. Try rephrasing as 'total revenue from Reeves 14H' or "
                 "'show all clients ranked by total amount'."
             )
