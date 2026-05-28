@@ -792,7 +792,7 @@ async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 10
 
 def _build_exact_count_answer(term: str, rows: list[dict]) -> str:
     if not rows:
-        return f'I found 0 occurrences of "{term}" in ready uploaded files.'
+        return f'[deterministic-v4] I found 0 occurrences of "{term}" in ready uploaded files.'
 
     whole_by_file: dict[str, dict] = {}
     sub_by_file: dict[str, dict] = {}
@@ -895,8 +895,8 @@ def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
             info["examples"].append(f"{loc}: {snippet[:220]}")
 
     lines = [
-        f'I found {len(by_file)} ready file{"s" if len(by_file) != 1 else ""} mentioning "{term}".',
-        "",
+    f'[deterministic-v4] I found {len(by_file)} ready file{"s" if len(by_file) != 1 else ""} mentioning "{term}".',
+    "",
     ]
 
     for i, (filename, info) in enumerate(sorted(by_file.items(), key=lambda x: x[1]["matches"], reverse=True), 1):
