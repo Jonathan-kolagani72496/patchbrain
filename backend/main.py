@@ -23,6 +23,13 @@ from supabase import create_client, Client
 from openai import AsyncOpenAI
 import anthropic
 import httpx
+@app.get("/debug/version")
+async def debug_version():
+    return {
+        "app": "patchbrain-api",
+        "deterministic_version": "v5-count-search-fix",
+        "message": "If you see this, Render is running the updated backend/main.py"
+    }
 
 load_dotenv()
 
