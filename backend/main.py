@@ -623,6 +623,12 @@ def _count_term_in_text(text: str, term: str) -> int:
 
 
 async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 1000) -> list[dict]:
+    """Load chunks that contain an exact term/phrase.
+
+    Keep this query conservative: only use columns known to exist in the core
+    schema. Do not depend on files.logical_name because older schemas may not
+    have it.
+    """
     pattern = _safe_sql_like_pattern(term)
     rows = await q("""
         select
@@ -635,7 +641,6 @@ async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 10
           fc.sheet_name,
           fc.row_start,
           fc.row_end,
-          f.logical_name,
           fv.original_filename,
           fv.status
         from file_chunks fc
@@ -662,7 +667,7 @@ def _build_exact_count_answer(term: str, rows: list[dict]) -> str:
         count = _count_term_in_text(row.get("content") or "", term)
         if count <= 0:
             continue
-        filename = row.get("logical_name") or row.get("original_filename") or "Unnamed file"
+        filename = row.get("original_filename") or "Unnamed file"
         item = by_file.setdefault(filename, {"count": 0, "chunks": 0})
         item["count"] += count
         item["chunks"] += 1
@@ -691,7 +696,7 @@ def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
     by_file: dict[str, dict] = {}
 
     for row in rows:
-        filename = row.get("logical_name") or row.get("original_filename") or "Unnamed file"
+        filename = row.get("original_filename") or "Unnamed file"
         count = _count_term_in_text(row.get("content") or "", term)
         info = by_file.setdefault(filename, {
             "matches": 0,
@@ -736,12 +741,19 @@ def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
 
 
 async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) -> str:
-    rows = await _load_chunks_matching_term(company_id, term)
-    if tool_name == "exact_count":
-        return _build_exact_count_answer(term, rows)
-    if tool_name == "files_mentioning":
-        return _build_files_mentioning_answer(term, rows)
-    return "I could not route that tool request."
+    try:
+        rows = await _load_chunks_matching_term(company_id, term)
+        if tool_name == "exact_count":
+            return _build_exact_count_answer(term, rows)
+        if tool_name == "files_mentioning":
+            return _build_files_mentioning_answer(term, rows)
+        return "I could not route that tool request."
+    except Exception as e:
+        print(f"Deterministic tool failed: tool={tool_name} term={term!r} error={e}")
+        return (
+            "I could not run the exact search/count tool because the backend hit a database error. "
+            "The normal document search still works. Check the API logs for the deterministic tool error."
+        )
 
 
 FILE_INVENTORY_PATTERNS = (
