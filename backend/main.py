@@ -635,14 +635,37 @@ def _safe_sql_like_pattern(term: str) -> str:
     return f"%{term}%"
 
 
-def _count_term_in_text(text: str, term: str) -> int:
+def _count_substring(text: str, term: str) -> int:
+    """Count all occurrences of term as a plain substring (case-insensitive).
+    Used for files_mentioning — matches T-04, Reeves 14H, timestamps, etc."""
     if not text or not term:
         return 0
-
-    if re.fullmatch(r"[A-Za-z0-9_-]+", term):
-        return len(re.findall(rf"(?<![A-Za-z0-9_-]){re.escape(term)}(?![A-Za-z0-9_-])", text, flags=re.I))
-
     return len(re.findall(re.escape(term), text, flags=re.I))
+
+
+def _count_whole_word(text: str, term: str) -> int:
+    """Count term as a whole word only (case-insensitive).
+    For pure-alpha terms (pump, time, truck) uses word boundaries that exclude
+    adjacent letters, digits, underscores, and hyphens — so drive_time, timestamp,
+    and T-04 are not false matches when searching for "time".
+    Non-alpha terms (T-04, Reeves 14H) fall through to plain substring count.
+    """
+    if not text or not term:
+        return 0
+    # Pure alpha word: require non-word boundary on both sides.
+    # [A-Za-z0-9_-] covers: letters, digits, underscore (col_names), hyphens (IDs).
+    if re.fullmatch(r"[A-Za-z]+", term):
+        return len(re.findall(
+            rf"(?<![A-Za-z0-9_\-]){re.escape(term)}(?![A-Za-z0-9_\-])",
+            text, flags=re.I
+        ))
+    # Everything else: plain substring
+    return len(re.findall(re.escape(term), text, flags=re.I))
+
+
+# Backward-compat alias — _build_files_mentioning_answer calls this
+def _count_term_in_text(text: str, term: str) -> int:
+    return _count_substring(text, term)
 
 
 async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 1000) -> list[dict]:
@@ -776,29 +799,55 @@ def _build_exact_count_answer(term: str, rows: list[dict]) -> str:
     if not rows:
         return f'I found 0 occurrences of "{term}" in ready uploaded files.'
 
-    by_file: dict[str, dict] = {}
-    total = 0
+    # Two passes: whole-word count first, substring count as fallback.
+    # This handles:
+    #   - "pump"  → whole-word match (avoids "pumping", "pump-off" noise)
+    #   - "time"  → whole-word=0 but substring finds timestamp/drive_time → report both
+    #   - "T-04"  → substring match (structured col=value text)
+    ww_by_file: dict[str, dict] = {}
+    sub_by_file: dict[str, dict] = {}
+    ww_total = 0
+    sub_total = 0
 
     for row in rows:
-        count = _count_term_in_text(row.get("content") or "", term)
-        if count <= 0:
-            continue
+        content  = row.get("content") or ""
         filename = row.get("original_filename") or "Unnamed file"
-        item = by_file.setdefault(filename, {"count": 0, "chunks": 0})
-        item["count"] += count
-        item["chunks"] += 1
-        total += count
 
-    if total == 0:
-        return f'I found 0 exact occurrences of "{term}" in ready uploaded files.'
+        ww  = _count_whole_word(content, term)
+        sub = _count_substring(content, term)
 
-    lines = [
-        f'I found {total} occurrence{"s" if total != 1 else ""} of "{term}" across {len(by_file)} ready file{"s" if len(by_file) != 1 else ""}.',
-        "",
-    ]
+        if ww > 0:
+            item = ww_by_file.setdefault(filename, {"count": 0, "chunks": 0})
+            item["count"] += ww
+            item["chunks"] += 1
+            ww_total += ww
 
-    for i, (filename, info) in enumerate(sorted(by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
-        lines.append(f"{i}. {filename} — {info['count']} occurrence{'s' if info['count'] != 1 else ''} in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}")
+        if sub > 0:
+            item = sub_by_file.setdefault(filename, {"count": 0, "chunks": 0})
+            item["count"] += sub
+            item["chunks"] += 1
+            sub_total += sub
+
+    # Prefer whole-word results if any exist
+    if ww_total > 0:
+        lines = [
+            f'I found {ww_total} whole-word occurrence{"s" if ww_total != 1 else ""} of "{term}" across {len(ww_by_file)} ready file{"s" if len(ww_by_file) != 1 else ""}.',
+            "",
+        ]
+        for i, (filename, info) in enumerate(sorted(ww_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
+            lines.append(f"{i}. {filename} — {info['count']} occurrence{'s' if info['count'] != 1 else ''} in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}")
+        if sub_total > ww_total:
+            lines.append(f"\nNote: {sub_total} total substring matches also exist (including partial matches like \"time\" in \"timestamp\").")
+    elif sub_total > 0:
+        # No whole-word matches but substring matches exist — report honestly
+        lines = [
+            f'I found 0 standalone occurrences of "{term}" as a whole word, but found {sub_total} substring match{"es" if sub_total != 1 else ""} across {len(sub_by_file)} file{"s" if len(sub_by_file) != 1 else ""} where "{term}" appears inside longer words (e.g. timestamp, drive_time).',
+            "",
+        ]
+        for i, (filename, info) in enumerate(sorted(sub_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
+            lines.append(f"{i}. {filename} — {info['count']} substring match{'es' if info['count'] != 1 else ''} in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}")
+    else:
+        return f'I found 0 occurrences of "{term}" in ready uploaded files.'
 
     if len(rows) >= 1000:
         lines.append("\nNote: count may be incomplete because the result limit was reached.")
@@ -813,7 +862,10 @@ def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
 
     for row in rows:
         filename = row.get("original_filename") or "Unnamed file"
-        count = _count_term_in_text(row.get("content") or "", term)
+        # Use substring count — ilike already confirmed the term is present.
+        # max(..., 1) ensures every matched chunk is counted even if our Python
+        # counter misses it (e.g. encoding differences, escaped characters).
+        count = _count_substring(row.get("content") or "", term)
         info = by_file.setdefault(filename, {
             "matches": 0,
             "chunks": 0,
