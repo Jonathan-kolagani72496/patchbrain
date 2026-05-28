@@ -718,11 +718,14 @@ async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 10
     cid_str = str(company_id)
 
     try:
+        # PostgREST treats bare hyphens in ilike patterns as range operators,
+        # causing queries like %T-04% to silently return empty. Escape them.
+        postgrest_pattern = pattern.replace("-", r"\-")
         chunk_res = (
             sb.table("file_chunks")
             .select("id,content,file_id,file_version_id,source_type,page_number,sheet_name,row_start,row_end,chunk_index")
             .eq("company_id", cid_str)
-            .ilike("content", pattern)
+            .ilike("content", postgrest_pattern)
             .order("chunk_index", desc=False)
             .limit(limit)
             .execute()
