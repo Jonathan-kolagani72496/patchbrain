@@ -23,6 +23,12 @@ from supabase import create_client, Client
 from openai import AsyncOpenAI
 import anthropic
 import httpx
+
+
+load_dotenv()
+
+app = FastAPI(title="PatchBrain API", version="3.0.0")
+
 @app.get("/debug/version")
 async def debug_version():
     return {
@@ -30,11 +36,6 @@ async def debug_version():
         "deterministic_version": "v5-count-search-fix",
         "message": "If you see this, Render is running the updated backend/main.py"
     }
-
-load_dotenv()
-
-app = FastAPI(title="PatchBrain API", version="3.0.0")
-
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "").rstrip("/")
 
 allowed_origins = [
