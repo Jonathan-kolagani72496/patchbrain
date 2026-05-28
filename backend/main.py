@@ -794,51 +794,66 @@ def _build_exact_count_answer(term: str, rows: list[dict]) -> str:
     if not rows:
         return f'I found 0 occurrences of "{term}" in ready uploaded files.'
 
-    ww_by_file:  dict[str, dict] = {}
+    whole_by_file: dict[str, dict] = {}
     sub_by_file: dict[str, dict] = {}
-    ww_total  = 0
+
+    whole_total = 0
     sub_total = 0
 
     for row in rows:
-        content  = row.get("content") or ""
+        content = row.get("content") or ""
+        whole_count = _count_whole_word(content, term)
+        substring_count = _count_substring(content, term)
+
         filename = row.get("original_filename") or "Unnamed file"
-        ww  = _count_whole_word(content, term)
-        sub = _count_substring(content, term)
-        if ww > 0:
-            item = ww_by_file.setdefault(filename, {"count": 0, "chunks": 0})
-            item["count"]  += ww
-            item["chunks"] += 1
-            ww_total += ww
-        if sub > 0:
+
+        if substring_count > 0:
             item = sub_by_file.setdefault(filename, {"count": 0, "chunks": 0})
-            item["count"]  += sub
+            item["count"] += substring_count
             item["chunks"] += 1
-            sub_total += sub
+            sub_total += substring_count
 
-    if ww_total > 0:
+        if whole_count > 0:
+            item = whole_by_file.setdefault(filename, {"count": 0, "chunks": 0})
+            item["count"] += whole_count
+            item["chunks"] += 1
+            whole_total += whole_count
+
+    if whole_total > 0:
         lines = [
-            f'I found {ww_total} whole-word occurrence{"s" if ww_total != 1 else ""} of "{term}" across {len(ww_by_file)} ready file{"s" if len(ww_by_file) != 1 else ""}.',
+            f'I found {whole_total} standalone occurrence{"s" if whole_total != 1 else ""} of "{term}" across {len(whole_by_file)} ready file{"s" if len(whole_by_file) != 1 else ""}.',
             "",
         ]
-        for i, (fn, info) in enumerate(sorted(ww_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
-            lines.append(f"{i}. {fn} — {info['count']} occurrence{'s' if info['count'] != 1 else ''} in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}")
-        if sub_total > ww_total:
-            extra = sub_total - ww_total
-            lines.append(f"\nNote: {extra} additional substring match{'es' if extra != 1 else ''} also exist where \"{term}\" appears inside longer words (e.g. timestamp, drive_time).")
-    elif sub_total > 0:
+
+        for i, (filename, info) in enumerate(sorted(whole_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
+            lines.append(
+                f"{i}. {filename} — {info['count']} standalone occurrence{'s' if info['count'] != 1 else ''} "
+                f"in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}"
+            )
+
+        if sub_total > whole_total:
+            lines.append("")
+            lines.append(
+                f'Note: "{term}" also appears {sub_total - whole_total} additional time{"s" if (sub_total - whole_total) != 1 else ""} as part of longer terms.'
+            )
+
+        return "\n".join(lines)
+
+    if sub_total > 0:
         lines = [
-            f'"{term}" does not appear as a standalone word, but was found {sub_total} time{"s" if sub_total != 1 else ""} as part of longer words (e.g. timestamp, drive_time, overtime) across {len(sub_by_file)} file{"s" if len(sub_by_file) != 1 else ""}.',
+            f'I found 0 standalone occurrences of "{term}", but {sub_total} substring match{"es" if sub_total != 1 else ""} across {len(sub_by_file)} ready file{"s" if len(sub_by_file) != 1 else ""}.',
             "",
         ]
-        for i, (fn, info) in enumerate(sorted(sub_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
-            lines.append(f"{i}. {fn} — {info['count']} substring match{'es' if info['count'] != 1 else ''} in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}")
-    else:
-        return f'I found 0 occurrences of "{term}" in ready uploaded files.'
 
-    if len(rows) >= 1000:
-        lines.append("\nNote: count may be incomplete because the result limit was reached.")
-    return "\n".join(lines)
+        for i, (filename, info) in enumerate(sorted(sub_by_file.items(), key=lambda x: x[1]["count"], reverse=True), 1):
+            lines.append(
+                f"{i}. {filename} — {info['count']} substring match{'es' if info['count'] != 1 else ''} "
+                f"in {info['chunks']} chunk{'s' if info['chunks'] != 1 else ''}"
+            )
 
+        return "\n".join(lines)
+
+    return f'I found 0 occurrences of "{term}" in ready uploaded files.'
 
 def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
     if not rows:
