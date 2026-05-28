@@ -625,40 +625,109 @@ def _count_term_in_text(text: str, term: str) -> int:
 async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 1000) -> list[dict]:
     """Load chunks that contain an exact term/phrase.
 
-    Uses the existing asyncpg DB_POOL directly. Do not call q(...); this backend
-    does not define that helper.
+    Prefer asyncpg DB_POOL when available. If the pool is unavailable because
+    SUPABASE_DB_PASSWORD is not configured, fall back to the existing Supabase
+    service client. This matches the rest of the backend.
     """
-    if not DB_POOL:
-        raise RuntimeError("DB_POOL is not available; deterministic tools require the async database pool")
-
     pattern = _safe_sql_like_pattern(term)
 
-    async with DB_POOL.acquire() as c:
-        rows = await c.fetch("""
-            select
-              fc.id as chunk_id,
-              fc.content,
-              fc.file_id,
-              fc.file_version_id,
-              fc.source_type,
-              fc.page_number,
-              fc.sheet_name,
-              fc.row_start,
-              fc.row_end,
-              fv.original_filename,
-              fv.status
-            from file_chunks fc
-            join file_versions fv on fv.id = fc.file_version_id
-            join files f on f.id = fc.file_id
-            where fc.company_id = $1
-              and fv.status = 'ready'
-              and f.deleted_at is null
-              and fc.content ilike $2
-            order by fv.created_at desc, fc.chunk_index asc
-            limit $3
-        """, uuid.UUID(str(company_id)), pattern, limit)
+    if DB_POOL:
+        try:
+            async with DB_POOL.acquire() as c:
+                rows = await c.fetch("""
+                    select
+                      fc.id as chunk_id,
+                      fc.content,
+                      fc.file_id,
+                      fc.file_version_id,
+                      fc.source_type,
+                      fc.page_number,
+                      fc.sheet_name,
+                      fc.row_start,
+                      fc.row_end,
+                      fv.original_filename,
+                      fv.status
+                    from file_chunks fc
+                    join file_versions fv on fv.id = fc.file_version_id
+                    join files f on f.id = fc.file_id
+                    where fc.company_id = $1
+                      and fv.status = 'ready'
+                      and f.deleted_at is null
+                      and fc.content ilike $2
+                    order by fv.created_at desc, fc.chunk_index asc
+                    limit $3
+                """, uuid.UUID(str(company_id)), pattern, limit)
+            return [dict(r) for r in rows]
+        except Exception as e:
+            print(f"Deterministic asyncpg query failed; falling back to Supabase client: {e}")
 
-    return [dict(r) for r in rows]
+    # Supabase client fallback. This avoids requiring SUPABASE_DB_PASSWORD.
+    sb = _sb()
+
+    chunk_res = (
+        sb.table("file_chunks")
+        .select("id,content,file_id,file_version_id,source_type,page_number,sheet_name,row_start,row_end,chunk_index")
+        .eq("company_id", str(company_id))
+        .ilike("content", pattern)
+        .order("chunk_index", desc=False)
+        .limit(limit)
+        .execute()
+    )
+    chunks = chunk_res.data or []
+    if not chunks:
+        return []
+
+    version_ids = sorted({str(c.get("file_version_id")) for c in chunks if c.get("file_version_id")})
+    file_ids = sorted({str(c.get("file_id")) for c in chunks if c.get("file_id")})
+
+    versions_by_id: dict[str, dict] = {}
+    if version_ids:
+        v_res = (
+            sb.table("file_versions")
+            .select("id,original_filename,status,created_at")
+            .in_("id", version_ids)
+            .eq("status", "ready")
+            .execute()
+        )
+        versions_by_id = {str(v["id"]): v for v in (v_res.data or [])}
+
+    active_file_ids: set[str] = set()
+    if file_ids:
+        f_res = (
+            sb.table("files")
+            .select("id,deleted_at")
+            .in_("id", file_ids)
+            .is_("deleted_at", "null")
+            .execute()
+        )
+        active_file_ids = {str(f["id"]) for f in (f_res.data or [])}
+
+    rows: list[dict] = []
+    for c in chunks:
+        vid = str(c.get("file_version_id"))
+        fid = str(c.get("file_id"))
+
+        if vid not in versions_by_id:
+            continue
+        if fid not in active_file_ids:
+            continue
+
+        v = versions_by_id[vid]
+        rows.append({
+            "chunk_id": c.get("id"),
+            "content": c.get("content"),
+            "file_id": c.get("file_id"),
+            "file_version_id": c.get("file_version_id"),
+            "source_type": c.get("source_type"),
+            "page_number": c.get("page_number"),
+            "sheet_name": c.get("sheet_name"),
+            "row_start": c.get("row_start"),
+            "row_end": c.get("row_end"),
+            "original_filename": v.get("original_filename"),
+            "status": v.get("status"),
+        })
+
+    return rows
 
 
 def _build_exact_count_answer(term: str, rows: list[dict]) -> str:
@@ -756,8 +825,8 @@ async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) ->
     except Exception as e:
         print(f"Deterministic tool failed: tool={tool_name} term={term!r} error={e}")
         return (
-            "I could not run the exact search/count tool because the backend hit a database error. "
-            "The normal document search still works. Check the API logs for the deterministic tool error."
+            "I could not run the exact search/count tool yet because the backend hit an internal query error. "
+            "The normal document search still works, and this failed test was saved in chat history."
         )
 
 
