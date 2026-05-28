@@ -24,6 +24,7 @@ from openai import AsyncOpenAI
 import anthropic
 import httpx
 
+from calc_tool import detect_calc_intent, run_structured_calc
 
 load_dotenv()
 
@@ -33,7 +34,7 @@ app = FastAPI(title="PatchBrain API", version="3.0.0")
 async def debug_version():
     return {
         "app": "patchbrain-api",
-        "deterministic_version": "v6-count-search-fix",
+        "deterministic_version": "v7-structured-calc-v2",
         "message": "If you see this, Render is running the updated backend/main.py"
     }
 FRONTEND_URL = os.environ.get("FRONTEND_URL", "").rstrip("/")
@@ -615,6 +616,9 @@ def _detect_deterministic_tool_intent(q: str) -> tuple[str, str] | None:
             if term:
                 return ("files_mentioning", term)
 
+    if detect_calc_intent(q):
+        return ("structured_calc", "")
+
     return None
 
 
@@ -718,14 +722,11 @@ async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 10
     cid_str = str(company_id)
 
     try:
-        # PostgREST treats bare hyphens in ilike patterns as range operators,
-        # causing queries like %T-04% to silently return empty. Escape them.
-        postgrest_pattern = pattern.replace("-", r"\-")
         chunk_res = (
             sb.table("file_chunks")
             .select("id,content,file_id,file_version_id,source_type,page_number,sheet_name,row_start,row_end,chunk_index")
             .eq("company_id", cid_str)
-            .ilike("content", postgrest_pattern)
+            .ilike("content", pattern)
             .order("chunk_index", desc=False)
             .limit(limit)
             .execute()
@@ -935,16 +936,36 @@ def _build_files_mentioning_answer(term: str, rows: list[dict]) -> str:
 
 async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) -> str:
     try:
+        if tool_name == "structured_calc":
+            return await run_structured_calc(
+                question=term,
+                company_id=str(company_id),
+                db_pool=DB_POOL,
+                sb_client=_sb(),
+            )
+
         rows = await _load_chunks_matching_term(company_id, term)
+
         if tool_name == "exact_count":
             return _build_exact_count_answer(term, rows)
+
         if tool_name == "files_mentioning":
             return _build_files_mentioning_answer(term, rows)
+
         return "I could not route that tool request."
+
     except Exception as e:
         import traceback
         print(f"Deterministic tool failed: tool={tool_name} term={term!r} company={company_id!r}")
         print(traceback.format_exc())
+
+        if tool_name == "structured_calc":
+            return (
+                "[structured-calc-v2] I could not complete that calculation because the backend hit an internal error. "
+                "The normal document search still works. Try rephrasing as 'total revenue from Reeves 14H' or "
+                "'show all clients ranked by total amount'."
+            )
+
         return (
             f'I could not complete the exact search for "{term}". '
             "Please try rephrasing your question, or ask me to summarize documents instead."
@@ -1493,7 +1514,9 @@ async def ask(b: AskBody, u=Depends(get_user)):
     deterministic_intent = _detect_deterministic_tool_intent(q)
     if deterministic_intent:
         tool_name, term = deterministic_intent
-        answer = await _run_deterministic_tool(cid, tool_name, term)
+        # For structured_calc, pass the original question as the term
+        effective_term = q if tool_name == "structured_calc" else term
+        answer = await _run_deterministic_tool(cid, tool_name, effective_term)
         return StreamingResponse(
             _stream_direct_answer(
                 sid, cid, uid, q, answer, new_count, history, srow, started_at,
