@@ -592,6 +592,7 @@ def _detect_deterministic_tool_intent(q: str) -> tuple[str, str] | None:
         if term:
             term = re.sub(r"\b(appear|appears|appeared|occur|occurs)\b.*$", "", term, flags=re.I).strip()
             term = re.sub(r"^\b(the word|word|phrase)\b", "", term, flags=re.I).strip()
+            term = _clean_extracted_term(term)
             if term:
                 return ("exact_count", term)
 
@@ -602,13 +603,35 @@ def _detect_deterministic_tool_intent(q: str) -> tuple[str, str] | None:
             "search for", "find exact", "exact phrase",
         ))
         if term:
-            return ("files_mentioning", term)
+            term = _clean_extracted_term(term)
+            if term:
+                return ("files_mentioning", term)
 
     return None
 
 
+def _clean_extracted_term(term: str) -> str:
+    """Strip surrounding quotes, trailing punctuation, and noise words from extracted search terms."""
+    if not term:
+        return term
+
+    term = term.strip()
+
+    # Strip matching quote wrappers.
+    for lq, rq in [('"', '"'), ("'", "'"), ("\u201c", "\u201d"), ("\u2018", "\u2019")]:
+        if term.startswith(lq) and term.endswith(rq) and len(term) > 2:
+            term = term[1:-1]
+            break
+
+    # Strip trailing garbage after an unmatched quote.
+    term = re.sub(r'["\u201c\u201d\u2018\u2019].*$', '', term).strip()
+    term = re.sub(r'[?!.,:;]+$', '', term).strip()
+    return term
+
+
 def _safe_sql_like_pattern(term: str) -> str:
-    term = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    """Escape a user term for PostgREST/Supabase ilike pattern matching."""
+    term = (term or "").replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{term}%"
 
 
@@ -662,45 +685,64 @@ async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 10
             print(f"Deterministic asyncpg query failed; falling back to Supabase client: {e}")
 
     # Supabase client fallback. This avoids requiring SUPABASE_DB_PASSWORD.
+    # NOTE: file_chunks may have RLS enabled. The service key bypasses RLS only
+    # when the Supabase client is initialized with the SERVICE role key (not anon).
+    # _sb() uses SUPABASE_SERVICE_KEY so this should bypass RLS correctly.
     sb = _sb()
+    cid_str = str(company_id)
 
-    chunk_res = (
-        sb.table("file_chunks")
-        .select("id,content,file_id,file_version_id,source_type,page_number,sheet_name,row_start,row_end,chunk_index")
-        .eq("company_id", str(company_id))
-        .ilike("content", pattern)
-        .order("chunk_index", desc=False)
-        .limit(limit)
-        .execute()
-    )
-    chunks = chunk_res.data or []
+    try:
+        chunk_res = (
+            sb.table("file_chunks")
+            .select("id,content,file_id,file_version_id,source_type,page_number,sheet_name,row_start,row_end,chunk_index")
+            .eq("company_id", cid_str)
+            .ilike("content", pattern)
+            .order("chunk_index", desc=False)
+            .limit(limit)
+            .execute()
+        )
+        chunks = chunk_res.data or []
+    except Exception as e:
+        print(f"_load_chunks_matching_term Supabase ilike query failed: {e!r}")
+        return []
+
     if not chunks:
         return []
 
     version_ids = sorted({str(c.get("file_version_id")) for c in chunks if c.get("file_version_id")})
-    file_ids = sorted({str(c.get("file_id")) for c in chunks if c.get("file_id")})
+    file_ids    = sorted({str(c.get("file_id"))          for c in chunks if c.get("file_id")})
 
     versions_by_id: dict[str, dict] = {}
     if version_ids:
-        v_res = (
-            sb.table("file_versions")
-            .select("id,original_filename,status,created_at")
-            .in_("id", version_ids)
-            .eq("status", "ready")
-            .execute()
-        )
-        versions_by_id = {str(v["id"]): v for v in (v_res.data or [])}
+        try:
+            v_res = (
+                sb.table("file_versions")
+                .select("id,original_filename,status,created_at")
+                .eq("company_id", cid_str)   # ← was missing — scope to company
+                .in_("id", version_ids)
+                .eq("status", "ready")
+                .execute()
+            )
+            versions_by_id = {str(v["id"]): v for v in (v_res.data or [])}
+        except Exception as e:
+            print(f"_load_chunks_matching_term versions lookup failed: {e!r}")
+            return []
 
     active_file_ids: set[str] = set()
     if file_ids:
-        f_res = (
-            sb.table("files")
-            .select("id,deleted_at")
-            .in_("id", file_ids)
-            .is_("deleted_at", "null")
-            .execute()
-        )
-        active_file_ids = {str(f["id"]) for f in (f_res.data or [])}
+        try:
+            f_res = (
+                sb.table("files")
+                .select("id,deleted_at")
+                .eq("company_id", cid_str)   # ← was missing — scope to company
+                .in_("id", file_ids)
+                .is_("deleted_at", "null")
+                .execute()
+            )
+            active_file_ids = {str(f["id"]) for f in (f_res.data or [])}
+        except Exception as e:
+            print(f"_load_chunks_matching_term files lookup failed: {e!r}")
+            return []
 
     rows: list[dict] = []
     for c in chunks:
@@ -714,17 +756,17 @@ async def _load_chunks_matching_term(company_id: str, term: str, limit: int = 10
 
         v = versions_by_id[vid]
         rows.append({
-            "chunk_id": c.get("id"),
-            "content": c.get("content"),
-            "file_id": c.get("file_id"),
-            "file_version_id": c.get("file_version_id"),
-            "source_type": c.get("source_type"),
-            "page_number": c.get("page_number"),
-            "sheet_name": c.get("sheet_name"),
-            "row_start": c.get("row_start"),
-            "row_end": c.get("row_end"),
+            "chunk_id":         c.get("id"),
+            "content":          c.get("content"),
+            "file_id":          c.get("file_id"),
+            "file_version_id":  c.get("file_version_id"),
+            "source_type":      c.get("source_type"),
+            "page_number":      c.get("page_number"),
+            "sheet_name":       c.get("sheet_name"),
+            "row_start":        c.get("row_start"),
+            "row_end":          c.get("row_end"),
             "original_filename": v.get("original_filename"),
-            "status": v.get("status"),
+            "status":           v.get("status"),
         })
 
     return rows
@@ -823,10 +865,12 @@ async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) ->
             return _build_files_mentioning_answer(term, rows)
         return "I could not route that tool request."
     except Exception as e:
-        print(f"Deterministic tool failed: tool={tool_name} term={term!r} error={e}")
+        import traceback
+        print(f"Deterministic tool failed: tool={tool_name} term={term!r} company={company_id!r}")
+        print(traceback.format_exc())
         return (
-            "I could not run the exact search/count tool yet because the backend hit an internal query error. "
-            "The normal document search still works, and this failed test was saved in chat history."
+            f'I could not complete the exact search for "{term}". '
+            "Please try rephrasing your question, or ask me to summarize documents instead."
         )
 
 
