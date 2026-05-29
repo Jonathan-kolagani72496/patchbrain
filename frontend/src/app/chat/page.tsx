@@ -1,16 +1,15 @@
 'use client'
-import { useState, useEffect, useRef, useCallback } from 'react'
+
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useRouter } from 'next/navigation'
-import { supabase, getAuthHeader, API_URL } from '@/lib/supabase'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
-
-// ── Types ──────────────────────────────────────────────────────────────────────
+import { API_URL, getAuthHeader, supabase } from '@/lib/supabase'
 
 type Citation = {
   index: number
   chunk_id: string
-  source_type: string
+  source_type?: string
   page_number?: number
   sheet_name?: string
   row_start?: number
@@ -25,245 +24,200 @@ type Message = {
   role: 'user' | 'assistant'
   content: string
   citations?: Citation[]
-  loading?: boolean
   streaming?: boolean
   created_at?: string
 }
 
 type Session = {
   id: string
-  title: string
-  message_count: number
-  updated_at: string
+  title?: string
+  message_count?: number
+  updated_at?: string
 }
 
-// ── Skeleton component ─────────────────────────────────────────────────────────
+function parseCitationList(value: unknown): Citation[] {
+  if (Array.isArray(value)) return value as Citation[]
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value)
+      return Array.isArray(parsed) ? parsed : []
+    } catch {
+      return []
+    }
+  }
+  return []
+}
+
+function timeAgo(value?: string) {
+  if (!value) return ''
+  const d = new Date(value)
+  if (Number.isNaN(d.getTime())) return ''
+  const seconds = Math.floor((Date.now() - d.getTime()) / 1000)
+  if (seconds < 60) return 'now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+function citationLabel(c: Citation) {
+  const file = c.filename || 'source'
+  if (c.sheet_name || c.row_start || c.row_end) return `${file} · rows ${c.row_start || '?'}-${c.row_end || '?'}`
+  if (c.page_number) return `${file} · page ${c.page_number}`
+  return file
+}
 
 function MessageSkeleton() {
   return (
     <div className="space-y-5 animate-pulse">
-      {[80, 55, 95, 65].map((w, i) => (
+      {[70, 45, 86, 62].map((w, i) => (
         <div key={i} className={`flex ${i % 2 === 0 ? 'justify-end' : 'justify-start'}`}>
-          <div
-            className={`h-9 rounded-2xl bg-gray-800 ${i % 2 === 0 ? 'rounded-tr-sm' : 'rounded-tl-sm'}`}
-            style={{ width: `${w}%` }}
-          />
+          <div className={`h-10 rounded-2xl bg-white/[0.06] ${i % 2 === 0 ? 'rounded-tr-md' : 'rounded-tl-md'}`} style={{ width: `${w}%` }} />
         </div>
       ))}
     </div>
   )
 }
 
-// ── Markdown renderer with citation injection ──────────────────────────────────
+function MarkdownSegment({ children }: { children: string }) {
+  if (!children) return null
+  return (
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={{
+        p: ({ children }) => <p className="mb-3 text-sm leading-7 text-slate-200 last:mb-0">{children}</p>,
+        h1: ({ children }) => <h1 className="mb-2 mt-4 text-lg font-semibold text-white">{children}</h1>,
+        h2: ({ children }) => <h2 className="mb-2 mt-4 text-base font-semibold text-white">{children}</h2>,
+        h3: ({ children }) => <h3 className="mb-2 mt-3 text-sm font-semibold text-white">{children}</h3>,
+        ul: ({ children }) => <ul className="mb-3 ml-5 list-disc space-y-1 text-sm leading-6 text-slate-200">{children}</ul>,
+        ol: ({ children }) => <ol className="mb-3 ml-5 list-decimal space-y-1 text-sm leading-6 text-slate-200">{children}</ol>,
+        strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
+        em: ({ children }) => <em className="text-slate-300">{children}</em>,
+        code: ({ inline, children }: any) => inline
+          ? <code className="rounded bg-slate-800 px-1.5 py-0.5 text-xs text-orange-200">{children}</code>
+          : <pre className="mb-3 overflow-x-auto rounded-2xl border border-white/10 bg-slate-950 p-4 text-xs text-slate-300"><code>{children}</code></pre>,
+        table: ({ children }) => <div className="mb-3 overflow-x-auto rounded-2xl border border-white/10"><table className="w-full border-collapse text-xs text-slate-300">{children}</table></div>,
+        th: ({ children }) => <th className="border-b border-white/10 bg-slate-900 px-3 py-2 text-left font-semibold text-slate-100">{children}</th>,
+        td: ({ children }) => <td className="border-b border-white/5 px-3 py-2">{children}</td>,
+        blockquote: ({ children }) => <blockquote className="mb-3 border-l-2 border-orange-400/60 pl-3 text-slate-400">{children}</blockquote>,
+      }}
+    >
+      {children}
+    </ReactMarkdown>
+  )
+}
 
-function AssistantMarkdown({
-  content,
-  citations,
-  streaming,
-  onCitationClick,
-}: {
+function AssistantContent({ content, citations, streaming, onCitationClick }: {
   content: string
   citations: Citation[]
   streaming?: boolean
-  onCitationClick: (c: Citation) => void
+  onCitationClick: (citation: Citation) => void
 }) {
-  // During streaming: avoid markdown flickering on partial bold/headers.
-  // Render plain text with cursor until streaming finishes.
   if (streaming) {
     return (
-      <p className="text-sm leading-7 text-gray-200 whitespace-pre-wrap">
+      <p className="whitespace-pre-wrap text-sm leading-7 text-slate-200">
         {content}
-        <span className="inline-block w-0.5 h-4 bg-orange-400 animate-pulse ml-0.5 align-text-bottom" />
+        <span className="ml-1 inline-block h-4 w-0.5 animate-pulse bg-orange-400 align-text-bottom" />
       </p>
     )
   }
 
-  // Post-stream: split on [S1] tags BEFORE passing to ReactMarkdown so we can
-  // inject clickable citation buttons inline with the rendered markdown.
-  // Strategy: replace [S1] with a placeholder, render markdown, then swap back.
-  const CITE_RE = /\[S(\d+)\]/g
-
-  // Build a version where citation tags become unique unicode placeholders
-  // that survive markdown rendering untouched.
-  const placeholders: { placeholder: string; index: number }[] = []
-  let idx = 0
-  const withPlaceholders = content.replace(CITE_RE, (_, num) => {
-    const ph = `\u{E0000}${idx}\u{E0001}` // Private Use Area chars — won't appear in real text
-    placeholders.push({ placeholder: ph, index: parseInt(num) })
-    idx++
-    return ph
-  })
-
-  // Custom renderer that splits text nodes on placeholders and injects buttons
-  const renderText = (text: string): React.ReactNode[] => {
-    if (!placeholders.length || !text.includes('\u{E0000}')) return [text]
-    const parts = text.split(/(\u{E0000}\d+\u{E0001})/u)
-    return parts.map((part, i) => {
-      const ph = placeholders.find(p => p.placeholder === part)
-      if (ph) {
-        const c = citations.find(c => c.index === ph.index)
-        return (
-          <button
-            key={i}
-            onClick={() => c && onCitationClick(c)}
-            className="inline-flex items-center bg-orange-500/20 hover:bg-orange-500/30 text-orange-300 text-xs font-semibold px-1.5 py-0.5 rounded mx-0.5 transition-colors cursor-pointer"
-          >
-            [S{ph.index}]
-          </button>
-        )
-      }
-      return part
-    })
-  }
-
+  const parts = content.split(/(\[S\d+\])/g)
   return (
     <div className="prose-chat">
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        components={{
-          // Paragraphs
-          p: ({ children }) => (
-            <p className="text-sm leading-7 text-gray-200 mb-3 last:mb-0">
-              {processChildren(children, renderText)}
-            </p>
-          ),
-          // Headings
-          h1: ({ children }) => <h1 className="text-base font-semibold text-white mt-4 mb-2">{children}</h1>,
-          h2: ({ children }) => <h2 className="text-sm font-semibold text-white mt-4 mb-2">{children}</h2>,
-          h3: ({ children }) => <h3 className="text-sm font-medium text-gray-100 mt-3 mb-1">{children}</h3>,
-          // Lists
-          ul: ({ children }) => <ul className="text-sm text-gray-200 space-y-1 mb-3 ml-4 list-disc">{children}</ul>,
-          ol: ({ children }) => <ol className="text-sm text-gray-200 space-y-1 mb-3 ml-4 list-decimal">{children}</ol>,
-          li: ({ children }) => (
-            <li className="leading-6">
-              {processChildren(children, renderText)}
-            </li>
-          ),
-          // Bold / italic
-          strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
-          em: ({ children }) => <em className="italic text-gray-300">{children}</em>,
-          // Code
-          code: ({ inline, children }: any) =>
-            inline ? (
-              <code className="bg-gray-800 text-orange-300 text-xs px-1.5 py-0.5 rounded font-mono">{children}</code>
-            ) : (
-              <pre className="bg-gray-800 rounded-lg p-3 overflow-x-auto mb-3">
-                <code className="text-xs text-gray-300 font-mono">{children}</code>
-              </pre>
-            ),
-          // Tables
-          table: ({ children }) => (
-            <div className="overflow-x-auto mb-3">
-              <table className="text-xs text-gray-300 border-collapse w-full">{children}</table>
-            </div>
-          ),
-          th: ({ children }) => <th className="border border-gray-700 bg-gray-800 px-3 py-1.5 text-left font-medium text-gray-200">{children}</th>,
-          td: ({ children }) => <td className="border border-gray-700 px-3 py-1.5">{children}</td>,
-          // Blockquote
-          blockquote: ({ children }) => (
-            <blockquote className="border-l-2 border-orange-500/50 pl-3 text-gray-400 italic mb-3">{children}</blockquote>
-          ),
-          // Horizontal rule
-          hr: () => <hr className="border-gray-700 my-4" />,
-          // Text nodes — inject citation buttons
-          text: ({ children }: any) => <>{renderText(String(children))}</>,
-        }}
-      >
-        {withPlaceholders}
-      </ReactMarkdown>
+      {parts.map((part, idx) => {
+        const match = part.match(/^\[S(\d+)\]$/)
+        if (!match) return <MarkdownSegment key={idx}>{part}</MarkdownSegment>
+        const sourceIndex = Number(match[1])
+        const citation = citations.find(c => Number(c.index) === sourceIndex)
+        return (
+          <button
+            key={idx}
+            onClick={() => citation && onCitationClick(citation)}
+            disabled={!citation}
+            className="mx-1 inline-flex items-center rounded-full border border-orange-400/20 bg-orange-400/10 px-2 py-0.5 text-xs font-semibold text-orange-200 transition hover:bg-orange-400/20 disabled:opacity-50"
+          >
+            [S{sourceIndex}]
+          </button>
+        )
+      })}
     </div>
   )
 }
 
-// Helper: recursively process react children to inject citation buttons into text nodes
-function processChildren(children: React.ReactNode, renderText: (s: string) => React.ReactNode[]): React.ReactNode {
-  if (typeof children === 'string') return <>{renderText(children)}</>
-  if (Array.isArray(children)) return <>{children.map((c, i) => <span key={i}>{processChildren(c, renderText)}</span>)}</>
-  return children
-}
-
-// ── Main component ─────────────────────────────────────────────────────────────
-
 export default function ChatPage() {
   const router = useRouter()
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
+  const scrollAreaRef = useRef<HTMLDivElement>(null)
+  const readerRef = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
+  const lastQuestionRef = useRef('')
 
-  const [sessions, setSessions]                   = useState<Session[]>([])
-  const [activeSession, setActiveSession]         = useState<string | null>(null)
-  const [messages, setMessages]                   = useState<Message[]>([])
-  const [loadingHistory, setLoadingHistory]       = useState(false)
-  const [input, setInput]                         = useState('')
-  const [sending, setSending]                     = useState(false)
-  const [selectedCitation, setSelectedCitation]   = useState<Citation | null>(null)
-  const [companyName, setCompanyName]             = useState('PatchBrain')
-  const [error, setError]                         = useState('')
-  const [followUps, setFollowUps]                 = useState<string[]>([])
-  const [showScrollBtn, setShowScrollBtn]         = useState(false)
-  const [copiedId, setCopiedId]                   = useState<string | null>(null)
-  const [hoveredMsg, setHoveredMsg]               = useState<string | null>(null)
+  const [sessions, setSessions] = useState<Session[]>([])
+  const [activeSession, setActiveSession] = useState<string | null>(null)
+  const [messages, setMessages] = useState<Message[]>([])
+  const [loadingHistory, setLoadingHistory] = useState(false)
+  const [input, setInput] = useState('')
+  const [sending, setSending] = useState(false)
+  const [selectedCitation, setSelectedCitation] = useState<Citation | null>(null)
+  const [companyName, setCompanyName] = useState('PatchBrain')
+  const [error, setError] = useState('')
+  const [followUps, setFollowUps] = useState<string[]>([])
+  const [showScrollBtn, setShowScrollBtn] = useState(false)
+  const [copiedId, setCopiedId] = useState<string | null>(null)
 
-  const bottomRef      = useRef<HTMLDivElement>(null)
-  const inputRef       = useRef<HTMLTextAreaElement>(null)
-  const scrollAreaRef  = useRef<HTMLDivElement>(null)
-  const readerRef      = useRef<ReadableStreamDefaultReader<Uint8Array> | null>(null)
-  const lastQuestionRef = useRef<string>('')
-
-  // ── Auth + init ──────────────────────────────────────────────────────────────
-
-  useEffect(() => {
-    supabase.auth.getSession().then(({ data }) => {
-      if (!data.session) router.push('/login')
-    })
-    loadSessions()
-    loadMe()
-  }, [])
-
-  // ── Auto-scroll to bottom ────────────────────────────────────────────────────
-
-  useEffect(() => {
-    if (!showScrollBtn) {
-      bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-    }
-  }, [messages])
-
-  // ── Scroll-to-bottom button visibility ──────────────────────────────────────
-
-  function handleScroll() {
-    const el = scrollAreaRef.current
-    if (!el) return
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight
-    setShowScrollBtn(distFromBottom > 200)
-  }
-
-  function scrollToBottom() {
-    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
-    setShowScrollBtn(false)
-  }
-
-  // ── Auto-grow textarea ───────────────────────────────────────────────────────
-
-  useEffect(() => {
-    const ta = inputRef.current
-    if (!ta) return
-    ta.style.height = 'auto'
-    ta.style.height = Math.min(ta.scrollHeight, 120) + 'px'
-  }, [input])
-
-  // ── Data loading ─────────────────────────────────────────────────────────────
-
-  async function loadMe() {
-    try {
-      const headers = await getAuthHeader()
-      const res = await fetch(`${API_URL}/me`, { headers })
-      if (res.ok) { const d = await res.json(); setCompanyName(d.company_name || 'PatchBrain') }
-    } catch {}
-  }
-
-  async function loadSessions() {
+  const loadSessions = useCallback(async () => {
     try {
       const headers = await getAuthHeader()
       const res = await fetch(`${API_URL}/conversations`, { headers })
       if (res.ok) setSessions(await res.json())
     } catch {}
+  }, [])
+
+  const loadMe = useCallback(async () => {
+    try {
+      const headers = await getAuthHeader()
+      const res = await fetch(`${API_URL}/me`, { headers })
+      if (res.ok) {
+        const data = await res.json()
+        setCompanyName(data.company_name || 'PatchBrain')
+      }
+    } catch {}
+  }, [])
+
+  useEffect(() => {
+    let alive = true
+    supabase.auth.getSession().then(({ data }) => {
+      if (!alive) return
+      if (!data.session) router.replace('/login')
+    })
+    loadSessions()
+    loadMe()
+    return () => { alive = false }
+  }, [loadMe, loadSessions, router])
+
+  useEffect(() => {
+    if (!showScrollBtn) bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+  }, [messages, showScrollBtn])
+
+  useEffect(() => {
+    const el = inputRef.current
+    if (!el) return
+    el.style.height = 'auto'
+    el.style.height = `${Math.min(el.scrollHeight, 140)}px`
+  }, [input])
+
+  function handleScroll() {
+    const el = scrollAreaRef.current
+    if (!el) return
+    setShowScrollBtn(el.scrollHeight - el.scrollTop - el.clientHeight > 220)
+  }
+
+  function scrollToBottom() {
+    bottomRef.current?.scrollIntoView({ behavior: 'smooth' })
+    setShowScrollBtn(false)
   }
 
   async function loadSession(sessionId: string) {
@@ -272,21 +226,28 @@ export default function ChatPage() {
     setFollowUps([])
     setError('')
     setLoadingHistory(true)
-    setMessages([]) // clear immediately so skeleton shows
+    setMessages([])
+
     try {
       const headers = await getAuthHeader()
       const res = await fetch(`${API_URL}/conversations/${sessionId}/messages`, { headers })
-      if (!res.ok) return
+      if (!res.ok) throw new Error('Failed to load conversation')
       const data = await res.json()
       setMessages((data.messages || []).map((m: any) => ({
-        id: m.id, role: m.role, content: m.content,
-        citations: m.citations_json || [], created_at: m.created_at,
+        id: m.id,
+        role: m.role,
+        content: m.content || '',
+        citations: parseCitationList(m.citations_json),
+        created_at: m.created_at,
       })))
-    } catch {}
-    finally { setLoadingHistory(false) }
+    } catch (err: any) {
+      setError(err?.message || 'Failed to load conversation')
+    } finally {
+      setLoadingHistory(false)
+    }
   }
 
-  async function newChat() {
+  function newChat() {
     setActiveSession(null)
     setMessages([])
     setFollowUps([])
@@ -300,52 +261,25 @@ export default function ChatPage() {
     try {
       const headers = await getAuthHeader()
       await fetch(`${API_URL}/conversations/${sessionId}`, { method: 'DELETE', headers })
-      if (activeSession === sessionId) { setActiveSession(null); setMessages([]) }
+      if (activeSession === sessionId) newChat()
       await loadSessions()
     } catch {}
   }
-
-  // ── Stop streaming ───────────────────────────────────────────────────────────
-
-  function stopStreaming() {
-    readerRef.current?.cancel()
-    readerRef.current = null
-    setSending(false)
-    // Mark last assistant message as no longer streaming
-    setMessages(prev => {
-      const copy = [...prev]
-      const last = copy[copy.length - 1]
-      if (last?.role === 'assistant') copy[copy.length - 1] = { ...last, streaming: false }
-      return copy
-    })
-  }
-
-  // ── Copy message ─────────────────────────────────────────────────────────────
 
   async function copyMessage(id: string, content: string) {
     try {
       await navigator.clipboard.writeText(content)
       setCopiedId(id)
-      setTimeout(() => setCopiedId(null), 2000)
+      window.setTimeout(() => setCopiedId(null), 1600)
     } catch {}
   }
 
-  // ── Regenerate ───────────────────────────────────────────────────────────────
-
-  function regenerate() {
-    if (!lastQuestionRef.current || sending) return
-    // Remove last assistant message and re-send
-    setMessages(prev => {
-      const copy = [...prev]
-      if (copy[copy.length - 1]?.role === 'assistant') copy.pop()
-      if (copy[copy.length - 1]?.role === 'user') copy.pop()
-      return copy
-    })
-    setInput(lastQuestionRef.current)
-    setTimeout(() => sendMessageWithText(lastQuestionRef.current), 50)
+  function stopStreaming() {
+    readerRef.current?.cancel()
+    readerRef.current = null
+    setSending(false)
+    setMessages(prev => prev.map((m, i) => i === prev.length - 1 && m.role === 'assistant' ? { ...m, streaming: false } : m))
   }
-
-  // ── Follow-up suggestions ────────────────────────────────────────────────────
 
   async function fetchFollowUps(question: string, answer: string) {
     try {
@@ -353,16 +287,14 @@ export default function ChatPage() {
       const res = await fetch(`${API_URL}/suggest-followups`, {
         method: 'POST',
         headers: { ...headers, 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question, answer: answer.slice(0, 600) }),
+        body: JSON.stringify({ question, answer: answer.slice(0, 700) }),
       })
       if (res.ok) {
-        const d = await res.json()
-        setFollowUps((d.suggestions || []).slice(0, 3))
+        const data = await res.json()
+        setFollowUps((data.suggestions || []).slice(0, 3))
       }
     } catch {}
   }
-
-  // ── Send message ─────────────────────────────────────────────────────────────
 
   async function sendMessage() {
     const text = input.trim()
@@ -378,8 +310,12 @@ export default function ChatPage() {
     setSelectedCitation(null)
     lastQuestionRef.current = question
 
-    const userMsg: Message = { id: Date.now().toString(), role: 'user', content: question }
+    const userMsg: Message = { id: `${Date.now()}-u`, role: 'user', content: question }
     setMessages(prev => [...prev, userMsg])
+
+    const assistantId = `${Date.now()}-a`
+    let assistantText = ''
+    let finalCitations: Citation[] = []
 
     try {
       const headers = await getAuthHeader()
@@ -389,24 +325,21 @@ export default function ChatPage() {
         body: JSON.stringify({ question, session_id: activeSession }),
       })
 
-      if (res.status === 401) { router.push('/login'); return }
+      if (res.status === 401) {
+        router.replace('/login')
+        return
+      }
 
       if (!res.ok) {
-        let msg = 'Something went wrong'
-        try { const d = await res.json(); msg = d.detail || msg } catch {}
-        setMessages(prev => [...prev, { id: Date.now().toString() + '-a', role: 'assistant', content: msg }])
-        if (res.status === 402) setError(msg)
-        return
+        const data = await res.json().catch(() => ({}))
+        throw new Error(data.detail || 'Question failed')
       }
 
       if (!res.body) throw new Error('No response body')
 
-      const reader  = res.body.getReader()
+      const reader = res.body.getReader()
       readerRef.current = reader
       const decoder = new TextDecoder()
-      const aId     = Date.now().toString() + '-a'
-      let assistantText   = ''
-      let finalCitations: Citation[] = []
       let buffer = ''
 
       while (true) {
@@ -415,80 +348,60 @@ export default function ChatPage() {
 
         buffer += decoder.decode(value, { stream: true })
         const events = buffer.split('\n\n')
-        buffer = events.pop() ?? ''
+        buffer = events.pop() || ''
 
         for (const event of events) {
-          if (!event.startsWith('data: ')) continue
-          const jsonText = event.replace(/^data:\s*/, '')
-          try {
-            const parsed = JSON.parse(jsonText)
+          const line = event.split('\n').find(row => row.startsWith('data: '))
+          if (!line) continue
 
-            if (parsed.type === 'session') {
+          try {
+            const parsed = JSON.parse(line.replace(/^data:\s*/, ''))
+
+            if (parsed.type === 'session' && parsed.session_id) {
               setActiveSession(parsed.session_id)
             }
 
             if (parsed.type === 'token') {
-              assistantText += parsed.text
+              assistantText += parsed.text || ''
               setMessages(prev => {
-                const copy = [...prev]
-                const last = copy[copy.length - 1]
-                if (last?.id === aId) {
-                  copy[copy.length - 1] = { ...last, content: assistantText, streaming: true }
-                } else {
-                  copy.push({ id: aId, role: 'assistant', content: assistantText, streaming: true })
+                const index = prev.findIndex(m => m.id === assistantId)
+                if (index >= 0) {
+                  const copy = [...prev]
+                  copy[index] = { ...copy[index], content: assistantText, streaming: true }
+                  return copy
                 }
-                return copy
+                return [...prev, { id: assistantId, role: 'assistant', content: assistantText, streaming: true }]
               })
             }
 
             if (parsed.type === 'done') {
-              finalCitations = parsed.citations || []
-              setMessages(prev => {
-                const copy = [...prev]
-                const last = copy[copy.length - 1]
-                if (last?.id === aId) {
-                  copy[copy.length - 1] = { ...last, content: assistantText, citations: finalCitations, streaming: false }
-                }
-                return copy
-              })
-              // Delay session reload so it doesn't interrupt the done animation
-              setTimeout(loadSessions, 600)
-              // Fetch follow-up suggestions in background
+              finalCitations = parseCitationList(parsed.citations)
+              setMessages(prev => prev.map(m => m.id === assistantId ? { ...m, content: assistantText, citations: finalCitations, streaming: false } : m))
+              window.setTimeout(loadSessions, 500)
               fetchFollowUps(question, assistantText)
             }
 
             if (parsed.type === 'error') {
-              const errMsg = parsed.message || 'An error occurred'
-              setMessages(prev => {
-                const copy = [...prev]
-                const last = copy[copy.length - 1]
-                if (last?.id === aId) {
-                  copy[copy.length - 1] = { ...last, content: errMsg, streaming: false }
-                } else {
-                  copy.push({ id: aId, role: 'assistant', content: errMsg })
-                }
-                return copy
-              })
-              if (errMsg.toLowerCase().includes('billing')) setError(errMsg)
+              throw new Error(parsed.message || 'Backend returned an error')
             }
-
           } catch (err) {
-            console.error('Bad SSE event:', jsonText, err)
+            if (err instanceof SyntaxError) console.error('Bad SSE event:', line)
+            else throw err
           }
         }
       }
-
-    } catch (e: any) {
-      if (e?.name === 'AbortError' || e?.message?.includes('cancel')) return // user stopped
+    } catch (err: any) {
+      if (err?.name === 'AbortError' || err?.message?.includes('cancel')) return
+      const msg = err?.message || 'Connection error — is the backend running?'
+      setError(msg)
       setMessages(prev => {
-        const copy = [...prev]
-        const last = copy[copy.length - 1]
-        if (last?.role === 'assistant') {
-          copy[copy.length - 1] = { ...last, content: 'Connection error — is the backend running?', streaming: false }
-        } else {
-          copy.push({ id: Date.now().toString() + '-a', role: 'assistant', content: 'Connection error — is the backend running?' })
+        const index = prev.findIndex(m => m.id === assistantId)
+        if (index >= 0) {
+          const copy = [...prev]
+          copy[index] = { ...copy[index], content: msg, streaming: false }
+          return copy
         }
-        return copy
+        return [...prev, { id: assistantId, role: 'assistant', content: msg }]
       })
     } finally {
       readerRef.current = null
@@ -497,376 +410,227 @@ export default function ChatPage() {
     }
   }
 
-  // ── Keyboard ─────────────────────────────────────────────────────────────────
-
-  function handleKeyDown(e: React.KeyboardEvent) {
-    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendMessage() }
+  function regenerate() {
+    if (!lastQuestionRef.current || sending) return
+    setMessages(prev => {
+      const copy = [...prev]
+      if (copy[copy.length - 1]?.role === 'assistant') copy.pop()
+      if (copy[copy.length - 1]?.role === 'user') copy.pop()
+      return copy
+    })
+    setTimeout(() => sendMessageWithText(lastQuestionRef.current), 50)
   }
 
-  // ── Citation helpers ──────────────────────────────────────────────────────────
-
-  function citationLabel(c: Citation) {
-    const fname = c.filename ? (c.filename.length > 18 ? c.filename.slice(0, 18) + '…' : c.filename) : ''
-    if (fname && c.sheet_name) return `${fname} · r${c.row_start}–${c.row_end}`
-    if (fname && c.page_number) return `${fname} · p.${c.page_number}`
-    if (fname) return fname
-    if (c.sheet_name) return `${c.sheet_name} r${c.row_start}–${c.row_end}`
-    if (c.page_number) return `Page ${c.page_number}`
-    return `Source ${c.index}`
+  function handleKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      sendMessage()
+    }
   }
 
-  function timeAgo(d: string) {
-    const m = Math.floor((Date.now() - new Date(d).getTime()) / 60000)
-    if (m < 1) return 'just now'
-    if (m < 60) return `${m}m ago`
-    const h = Math.floor(m / 60)
-    if (h < 24) return `${h}h ago`
-    return `${Math.floor(h / 24)}d ago`
+  async function signOut() {
+    await supabase.auth.signOut()
+    router.replace('/login')
   }
 
-  // ── Render ────────────────────────────────────────────────────────────────────
-
-  const isLastAssistant = (msg: Message) => {
-    const assistantMsgs = messages.filter(m => m.role === 'assistant')
-    return assistantMsgs[assistantMsgs.length - 1]?.id === msg.id
-  }
+  const examples = [
+    'What files do I have access to?',
+    'What was Cimarron Unit 7 revenue by month?',
+    'Compare Reeves 14H and Cimarron Unit 7 by barrels hauled.',
+    'Which driver generated the most revenue?',
+  ]
 
   return (
-    <div className="h-screen bg-gray-950 text-white flex overflow-hidden">
-
-      {/* ── Sidebar ── */}
-      <div className="w-60 border-r border-gray-800 flex flex-col shrink-0 bg-gray-900">
-        <div className="p-3 border-b border-gray-800">
-          <div className="flex items-center gap-2 mb-3">
-            <div className="w-6 h-6 bg-orange-500 rounded flex items-center justify-center shrink-0">
-              <span className="text-white font-bold text-xs">P</span>
+    <main className="h-screen overflow-hidden bg-slate-950 text-white lg:grid lg:grid-cols-[280px_1fr]">
+      <aside className="hidden border-r border-white/10 bg-slate-950/90 lg:flex lg:flex-col">
+        <div className="border-b border-white/10 p-4">
+          <div className="mb-4 flex items-center gap-3">
+            <div className="flex h-10 w-10 items-center justify-center rounded-2xl bg-orange-500 shadow-lg shadow-orange-500/20">
+              <span className="font-black">P</span>
             </div>
-            <span className="text-white text-sm font-medium truncate">{companyName}</span>
+            <div className="min-w-0">
+              <p className="truncate text-sm font-semibold">{companyName}</p>
+              <p className="text-xs text-slate-500">PatchBrain Chat</p>
+            </div>
           </div>
-          <button onClick={newChat}
-            className="w-full bg-orange-500 hover:bg-orange-600 text-white text-sm font-medium py-2 rounded-lg transition-colors">
+          <button onClick={newChat} className="w-full rounded-xl bg-orange-500 px-4 py-2.5 text-sm font-semibold shadow-lg shadow-orange-500/20 transition hover:bg-orange-400">
             + New chat
           </button>
         </div>
 
-        <div className="flex-1 overflow-y-auto py-1">
-          {sessions.length === 0
-            ? <p className="text-gray-600 text-xs px-4 py-4">No conversations yet</p>
-            : sessions.map(s => (
-              <div key={s.id} onClick={() => loadSession(s.id)}
-                className={`group flex items-start gap-2 px-3 py-2.5 cursor-pointer hover:bg-gray-800 mx-1 rounded-lg transition-colors ${activeSession === s.id ? 'bg-gray-800' : ''}`}>
-                <div className="flex-1 min-w-0">
-                  <p className={`text-xs truncate leading-snug ${activeSession === s.id ? 'text-white' : 'text-gray-300'}`}>
-                    {s.title || 'New conversation'}
-                  </p>
-                  <p className="text-gray-600 text-xs mt-0.5">{timeAgo(s.updated_at)}</p>
+        <div className="custom-scrollbar flex-1 overflow-y-auto p-2">
+          {sessions.length === 0 ? (
+            <p className="px-3 py-5 text-xs text-slate-600">No conversations yet</p>
+          ) : sessions.map(session => (
+            <div
+              key={session.id}
+              onClick={() => loadSession(session.id)}
+              className={`group mb-1 cursor-pointer rounded-2xl px-3 py-3 transition hover:bg-white/[0.06] ${activeSession === session.id ? 'bg-white/[0.08]' : ''}`}
+            >
+              <div className="flex items-start gap-2">
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm text-slate-200">{session.title || 'New conversation'}</p>
+                  <p className="mt-1 text-xs text-slate-600">{timeAgo(session.updated_at)}</p>
                 </div>
-                <button onClick={e => deleteSession(s.id, e)}
-                  className="opacity-0 group-hover:opacity-100 text-gray-600 hover:text-red-400 text-xs shrink-0 transition-all mt-0.5">
-                  ✕
+                <button onClick={e => deleteSession(session.id, e)} className="opacity-0 rounded-lg px-1.5 text-slate-600 transition hover:bg-red-500/10 hover:text-red-300 group-hover:opacity-100">
+                  ×
                 </button>
               </div>
-            ))
-          }
-        </div>
-
-        <div className="p-3 border-t border-gray-800 space-y-1">
-          <button onClick={() => router.push('/dashboard')}
-            className="w-full text-left text-gray-400 hover:text-gray-300 text-xs px-3 py-2 rounded-lg hover:bg-gray-800 transition-colors">
-            ← File Library
-          </button>
-          <button onClick={async () => { await supabase.auth.signOut(); router.push('/login') }}
-            className="w-full text-left text-gray-500 hover:text-gray-400 text-xs px-3 py-2 rounded-lg hover:bg-gray-800 transition-colors">
-            Sign out
-          </button>
-        </div>
-      </div>
-
-      {/* ── Chat + source panel ── */}
-      <div className="flex flex-1 overflow-hidden">
-
-        {/* Messages column */}
-        <div className="flex flex-col flex-1 overflow-hidden relative">
-          {error && (
-            <div className="bg-red-500/10 border-b border-red-500/20 px-6 py-3 text-sm text-red-400 flex items-center justify-between shrink-0">
-              <span>⚠ {error}</span>
-              <button onClick={() => setError('')} className="hover:text-red-300 ml-4">✕</button>
             </div>
-          )}
+          ))}
+        </div>
 
-          {/* Scroll area */}
-          <div
-            ref={scrollAreaRef}
-            onScroll={handleScroll}
-            className="flex-1 overflow-y-auto px-6 py-6 space-y-6"
-          >
-            {/* Empty state */}
-            {!loadingHistory && messages.length === 0 && (
-              <div className="h-full flex flex-col items-center justify-center text-center">
-                <div className="w-12 h-12 bg-orange-500/10 border border-orange-500/20 rounded-2xl flex items-center justify-center mb-4">
-                  <span className="text-orange-400 text-xl">⚡</span>
+        <div className="border-t border-white/10 p-3 space-y-1">
+          <button onClick={() => router.push('/dashboard')} className="w-full rounded-xl px-3 py-2 text-left text-sm text-slate-400 transition hover:bg-white/[0.06] hover:text-white">← File Library</button>
+          <button onClick={signOut} className="w-full rounded-xl px-3 py-2 text-left text-sm text-slate-500 transition hover:bg-white/[0.06] hover:text-white">Sign out</button>
+        </div>
+      </aside>
+
+      <section className="flex h-screen min-w-0 flex-col">
+        <header className="flex items-center justify-between border-b border-white/10 bg-slate-950/85 px-4 py-3 backdrop-blur lg:px-6">
+          <div>
+            <p className="text-sm font-semibold">Ask PatchBrain</p>
+            <p className="text-xs text-slate-500">Answers from your uploaded files, tools, and citations.</p>
+          </div>
+          <div className="flex items-center gap-2 lg:hidden">
+            <button onClick={() => router.push('/dashboard')} className="rounded-xl border border-white/10 px-3 py-2 text-xs text-slate-300">Files</button>
+            <button onClick={signOut} className="rounded-xl border border-white/10 px-3 py-2 text-xs text-slate-300">Sign out</button>
+          </div>
+        </header>
+
+        {error && (
+          <div className="border-b border-red-400/20 bg-red-400/10 px-6 py-3 text-sm text-red-200">
+            {error}
+          </div>
+        )}
+
+        <div className="flex min-h-0 flex-1">
+          <div className="relative flex min-w-0 flex-1 flex-col">
+            <div ref={scrollAreaRef} onScroll={handleScroll} className="custom-scrollbar flex-1 overflow-y-auto px-4 py-6 lg:px-8">
+              {!loadingHistory && messages.length === 0 && (
+                <div className="mx-auto flex min-h-full max-w-2xl flex-col items-center justify-center text-center">
+                  <div className="mb-5 flex h-14 w-14 items-center justify-center rounded-3xl border border-orange-400/20 bg-orange-400/10 text-xl text-orange-200">⚡</div>
+                  <h1 className="text-2xl font-semibold tracking-tight">Ask about your operations documents</h1>
+                  <p className="mt-3 max-w-md text-sm leading-6 text-slate-400">
+                    Use natural language for file inventory, exact searches, structured calculations, summaries, and source-backed answers.
+                  </p>
+                  <div className="mt-7 grid w-full gap-2 sm:grid-cols-2">
+                    {examples.map(example => (
+                      <button key={example} onClick={() => { setInput(example); inputRef.current?.focus() }} className="rounded-2xl border border-white/10 bg-white/[0.035] px-4 py-3 text-left text-sm text-slate-300 transition hover:border-orange-400/30 hover:bg-orange-400/10 hover:text-white">
+                        {example}
+                      </button>
+                    ))}
+                  </div>
                 </div>
-                <h2 className="text-white font-medium mb-1">Ask about your documents</h2>
-                <p className="text-gray-500 text-sm max-w-xs mb-6">Questions are answered from your uploaded files with source citations.</p>
-                <div className="grid grid-cols-1 gap-2 w-full max-w-sm">
-                  {['Which invoices are overdue?', 'Are any trucks overdue for service?', 'Which employees have expired H2S certs?', 'Show run tickets missing signatures'].map(q => (
-                    <button key={q} onClick={() => { setInput(q); inputRef.current?.focus() }}
-                      className="text-left text-sm text-gray-400 hover:text-gray-300 bg-gray-900 hover:bg-gray-800 border border-gray-800 rounded-lg px-4 py-2.5 transition-colors">
+              )}
+
+              {loadingHistory && <MessageSkeleton />}
+
+              {!loadingHistory && messages.map(msg => (
+                <div key={msg.id} className={`mb-6 flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-3xl ${msg.role === 'user' ? 'rounded-3xl rounded-tr-md bg-orange-500 px-5 py-3 text-white shadow-lg shadow-orange-500/10' : 'w-full rounded-3xl rounded-tl-md border border-white/10 bg-white/[0.04] px-5 py-4'}`}>
+                    {msg.role === 'user' ? (
+                      <p className="whitespace-pre-wrap text-sm leading-6">{msg.content}</p>
+                    ) : (
+                      <AssistantContent content={msg.content} citations={msg.citations || []} streaming={msg.streaming} onCitationClick={setSelectedCitation} />
+                    )}
+                    {msg.role === 'assistant' && !msg.streaming && (
+                      <div className="mt-3 flex items-center gap-2 border-t border-white/10 pt-3">
+                        <button onClick={() => copyMessage(msg.id, msg.content)} className="rounded-lg px-2 py-1 text-xs text-slate-500 transition hover:bg-white/5 hover:text-slate-200">
+                          {copiedId === msg.id ? 'Copied' : 'Copy'}
+                        </button>
+                        <button onClick={regenerate} disabled={sending} className="rounded-lg px-2 py-1 text-xs text-slate-500 transition hover:bg-white/5 hover:text-slate-200 disabled:opacity-40">
+                          Regenerate
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+
+              {followUps.length > 0 && !sending && (
+                <div className="mx-auto mb-6 flex max-w-3xl flex-wrap gap-2">
+                  {followUps.map(q => (
+                    <button key={q} onClick={() => sendMessageWithText(q)} className="rounded-full border border-white/10 bg-white/[0.04] px-3 py-1.5 text-xs text-slate-300 transition hover:border-orange-400/30 hover:bg-orange-400/10 hover:text-white">
                       {q}
                     </button>
                   ))}
                 </div>
-              </div>
+              )}
+
+              <div ref={bottomRef} />
+            </div>
+
+            {showScrollBtn && (
+              <button onClick={scrollToBottom} className="absolute bottom-28 left-1/2 -translate-x-1/2 rounded-full border border-white/10 bg-slate-900 px-3 py-2 text-xs text-slate-300 shadow-xl transition hover:bg-slate-800">
+                Jump to latest
+              </button>
             )}
 
-            {/* Skeleton while loading history */}
-            {loadingHistory && <MessageSkeleton />}
-
-            {/* Messages */}
-            {!loadingHistory && messages.map(msg => (
-              <div
-                key={msg.id}
-                className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'} group/msg`}
-                onMouseEnter={() => setHoveredMsg(msg.id)}
-                onMouseLeave={() => setHoveredMsg(null)}
-              >
-                <div className={`max-w-3xl w-full ${msg.role === 'user' ? 'flex justify-end' : ''}`}>
-
-                  {/* User bubble */}
-                  {msg.role === 'user' && (
-                    <div className="bg-gray-800 rounded-2xl rounded-tr-sm px-4 py-3 max-w-xl">
-                      <p className="text-sm text-white leading-relaxed">{msg.content}</p>
-                    </div>
-                  )}
-
-                  {/* Assistant message */}
-                  {msg.role === 'assistant' && (
-                    <div className="w-full">
-                      {msg.loading ? (
-                        <div className="flex items-center gap-2 text-gray-400 text-sm py-2">
-                          <span className="w-4 h-4 border-2 border-gray-600 border-t-orange-400 rounded-full animate-spin" />
-                          Searching your files…
-                        </div>
-                      ) : (
-                        <>
-                          {/* Markdown content */}
-                          <AssistantMarkdown
-                            content={msg.content}
-                            citations={msg.citations || []}
-                            streaming={msg.streaming}
-                            onCitationClick={setSelectedCitation}
-                          />
-
-                          {/* Citation pills */}
-                          {msg.citations && msg.citations.length > 0 && !msg.streaming && (
-                            <div className="mt-3 flex flex-wrap gap-1.5">
-                              {msg.citations.slice(0, 8).map(c => (
-                                <button key={c.chunk_id}
-                                  onClick={() => setSelectedCitation(selectedCitation?.chunk_id === c.chunk_id ? null : c)}
-                                  className={`text-xs px-2.5 py-1 rounded-full border transition-colors ${
-                                    selectedCitation?.chunk_id === c.chunk_id
-                                      ? 'bg-orange-500/20 border-orange-500/40 text-orange-300'
-                                      : 'bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-600'
-                                  }`}>
-                                  [{c.index}] {citationLabel(c)}
-                                </button>
-                              ))}
-                            </div>
-                          )}
-
-                          {/* Action buttons — visible on hover, only when not streaming */}
-                          {!msg.streaming && hoveredMsg === msg.id && (
-                            <div className="flex items-center gap-1 mt-2 transition-opacity">
-                              {/* Copy */}
-                              <button
-                                onClick={() => copyMessage(msg.id, msg.content)}
-                                title="Copy response"
-                                className="flex items-center gap-1 text-gray-500 hover:text-gray-300 text-xs px-2 py-1 rounded-md hover:bg-gray-800 transition-colors"
-                              >
-                                {copiedId === msg.id ? (
-                                  <><span className="text-green-400">✓</span><span className="text-green-400">Copied</span></>
-                                ) : (
-                                  <><CopyIcon /><span>Copy</span></>
-                                )}
-                              </button>
-
-                              {/* Regenerate — only on the last assistant message */}
-                              {isLastAssistant(msg) && !sending && (
-                                <button
-                                  onClick={regenerate}
-                                  title="Regenerate response"
-                                  className="flex items-center gap-1 text-gray-500 hover:text-gray-300 text-xs px-2 py-1 rounded-md hover:bg-gray-800 transition-colors"
-                                >
-                                  <RegenerateIcon />
-                                  <span>Regenerate</span>
-                                </button>
-                              )}
-
-                              {/* Timestamp — on hover only */}
-                              {msg.created_at && (
-                                <span className="text-gray-600 text-xs ml-1">{timeAgo(msg.created_at)}</span>
-                              )}
-                            </div>
-                          )}
-                        </>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-            ))}
-
-            {/* Follow-up suggestion chips */}
-            {followUps.length > 0 && !sending && (
-              <div className="flex flex-wrap gap-2 pt-1 animate-fade-in">
-                {followUps.map((q, i) => (
-                  <button
-                    key={i}
-                    onClick={() => {
-                      setFollowUps([])
-                      sendMessageWithText(q)
-                    }}
-                    className="text-xs text-gray-300 bg-gray-800 hover:bg-gray-700 border border-gray-700 hover:border-gray-600 rounded-full px-3 py-1.5 transition-colors"
-                  >
-                    {q} →
+            <div className="border-t border-white/10 bg-slate-950/90 px-4 py-4 backdrop-blur lg:px-8">
+              <div className="mx-auto flex max-w-4xl items-end gap-3 rounded-3xl border border-white/10 bg-white/[0.04] p-2 shadow-2xl shadow-black/20">
+                <textarea
+                  ref={inputRef}
+                  value={input}
+                  onChange={e => setInput(e.target.value)}
+                  onKeyDown={handleKeyDown}
+                  disabled={sending}
+                  rows={1}
+                  placeholder="Ask about tickets, invoices, compliance reports, or field activity…"
+                  className="custom-scrollbar max-h-36 min-h-[44px] flex-1 resize-none bg-transparent px-4 py-3 text-sm text-white outline-none placeholder:text-slate-600 disabled:opacity-60"
+                />
+                {sending ? (
+                  <button onClick={stopStreaming} className="mb-0.5 rounded-2xl border border-red-400/20 bg-red-500/10 px-4 py-3 text-sm font-semibold text-red-200 transition hover:bg-red-500/15">
+                    Stop
                   </button>
-                ))}
+                ) : (
+                  <button onClick={sendMessage} disabled={!input.trim()} className="mb-0.5 rounded-2xl bg-orange-500 px-4 py-3 text-sm font-semibold text-white shadow-lg shadow-orange-500/20 transition hover:bg-orange-400 disabled:cursor-not-allowed disabled:opacity-40">
+                    Send
+                  </button>
+                )}
               </div>
-            )}
-
-            <div ref={bottomRef} />
+              <p className="mx-auto mt-2 max-w-4xl text-xs text-slate-600">Enter sends. Shift + Enter adds a new line.</p>
+            </div>
           </div>
 
-          {/* Scroll-to-bottom button */}
-          {showScrollBtn && (
-            <button
-              onClick={scrollToBottom}
-              className="absolute bottom-24 right-6 w-8 h-8 bg-gray-800 hover:bg-gray-700 border border-gray-700 rounded-full flex items-center justify-center text-gray-300 hover:text-white shadow-lg transition-all z-10"
-            >
-              ↓
-            </button>
-          )}
-
-          {/* Input bar */}
-          <div className="border-t border-gray-800 px-6 py-4 shrink-0">
-            <div className="flex items-end gap-3 bg-gray-900 border border-gray-700 focus-within:border-gray-600 rounded-xl px-4 py-3 transition-colors">
-              <textarea
-                ref={inputRef}
-                value={input}
-                onChange={e => setInput(e.target.value)}
-                onKeyDown={handleKeyDown}
-                placeholder="Ask about your files… (Enter to send, Shift+Enter for new line)"
-                rows={1}
-                style={{ maxHeight: '120px', resize: 'none' }}
-                className="flex-1 bg-transparent text-white text-sm placeholder-gray-500 focus:outline-none overflow-y-auto"
-              />
-              {/* Stop button while streaming / Send button otherwise */}
-              {sending ? (
-                <button
-                  onClick={stopStreaming}
-                  title="Stop generating"
-                  className="shrink-0 bg-gray-700 hover:bg-red-600 text-white w-8 h-8 rounded-lg flex items-center justify-center transition-colors"
-                >
-                  <StopIcon />
-                </button>
-              ) : (
-                <button
-                  onClick={sendMessage}
-                  disabled={!input.trim()}
-                  className="shrink-0 bg-orange-500 hover:bg-orange-600 disabled:bg-gray-700 disabled:text-gray-500 text-white w-8 h-8 rounded-lg flex items-center justify-center transition-colors"
-                >
-                  ↑
-                </button>
-              )}
+          <aside className="hidden w-96 shrink-0 border-l border-white/10 bg-slate-950/80 xl:block">
+            <div className="border-b border-white/10 p-4">
+              <p className="text-sm font-semibold">Source evidence</p>
+              <p className="mt-1 text-xs text-slate-500">Click a citation in an answer to inspect the source preview.</p>
             </div>
-            <p className="text-gray-600 text-xs mt-2 text-center">
-              Answers grounded in your uploaded files · Click [S1] tags to see exact sources
-            </p>
-          </div>
-        </div>
-
-        {/* Source panel */}
-        {selectedCitation && (
-          <div className="w-72 border-l border-gray-800 bg-gray-900 flex flex-col shrink-0">
-            <div className="px-4 py-3 border-b border-gray-800 flex items-center justify-between">
-              <span className="text-white text-sm font-medium">Source [{selectedCitation.index}]</span>
-              <button onClick={() => setSelectedCitation(null)} className="text-gray-500 hover:text-gray-300 text-lg leading-none">×</button>
-            </div>
-            <div className="p-4 flex-1 overflow-y-auto space-y-4">
-              {selectedCitation.filename && (
-                <div>
-                  <span className="text-gray-500 text-xs uppercase tracking-wide">File</span>
-                  <p className="text-gray-200 text-sm mt-1 font-medium break-all">{selectedCitation.filename}</p>
-                </div>
-              )}
-              {selectedCitation.page_number && (
-                <div>
-                  <span className="text-gray-500 text-xs uppercase tracking-wide">Page</span>
-                  <p className="text-gray-300 text-sm mt-1">{selectedCitation.page_number}</p>
-                </div>
-              )}
-              {selectedCitation.sheet_name && (
-                <div>
-                  <span className="text-gray-500 text-xs uppercase tracking-wide">Sheet · Rows</span>
-                  <p className="text-gray-300 text-sm mt-1">{selectedCitation.sheet_name} — rows {selectedCitation.row_start}–{selectedCitation.row_end}</p>
-                </div>
-              )}
-              {selectedCitation.preview && (
-                <div>
-                  <span className="text-gray-500 text-xs uppercase tracking-wide">Content preview</span>
-                  <pre className="text-gray-400 text-xs mt-2 bg-gray-800 rounded-lg p-3 whitespace-pre-wrap break-words leading-relaxed font-mono overflow-x-auto">
-                    {selectedCitation.preview}
+            <div className="custom-scrollbar h-[calc(100vh-73px)] overflow-y-auto p-4">
+              {selectedCitation ? (
+                <div className="rounded-3xl border border-white/10 bg-white/[0.04] p-4">
+                  <div className="mb-3 flex items-start justify-between gap-3">
+                    <div>
+                      <p className="text-xs font-medium uppercase tracking-[0.18em] text-orange-300">[S{selectedCitation.index}]</p>
+                      <h3 className="mt-1 text-sm font-semibold text-white">{citationLabel(selectedCitation)}</h3>
+                    </div>
+                    <button onClick={() => setSelectedCitation(null)} className="rounded-lg px-2 py-1 text-slate-500 transition hover:bg-white/5 hover:text-white">×</button>
+                  </div>
+                  <dl className="mb-4 grid grid-cols-2 gap-3 text-xs">
+                    <div className="rounded-2xl bg-slate-950/60 p-3">
+                      <dt className="text-slate-600">Type</dt>
+                      <dd className="mt-1 text-slate-300">{selectedCitation.source_type || '—'}</dd>
+                    </div>
+                    <div className="rounded-2xl bg-slate-950/60 p-3">
+                      <dt className="text-slate-600">Score</dt>
+                      <dd className="mt-1 text-slate-300">{typeof selectedCitation.score === 'number' ? selectedCitation.score.toFixed(3) : '—'}</dd>
+                    </div>
+                  </dl>
+                  <pre className="whitespace-pre-wrap rounded-2xl border border-white/10 bg-slate-950 p-4 text-xs leading-6 text-slate-300">
+                    {selectedCitation.preview || 'No preview returned for this citation.'}
                   </pre>
                 </div>
-              )}
-              {selectedCitation.score != null && (
-                <div>
-                  <span className="text-gray-500 text-xs uppercase tracking-wide">Relevance</span>
-                  <div className="mt-2 flex items-center gap-2">
-                    <div className="flex-1 h-1.5 bg-gray-700 rounded-full overflow-hidden">
-                      <div className="h-full bg-orange-500 rounded-full"
-                        style={{ width: `${Math.min(100, Math.round((selectedCitation.score || 0) * 100))}%` }} />
-                    </div>
-                    <span className="text-gray-400 text-xs">{Math.min(100, Math.round((selectedCitation.score || 0) * 100))}%</span>
-                  </div>
+              ) : (
+                <div className="rounded-3xl border border-dashed border-white/10 p-8 text-center text-sm text-slate-500">
+                  No source selected.
                 </div>
               )}
-              <div className="pt-2 border-t border-gray-800">
-                <span className="text-gray-600 text-xs uppercase tracking-wide">Type</span>
-                <p className="text-gray-500 text-xs mt-1 capitalize">{selectedCitation.source_type?.replace(/_/g, ' ')}</p>
-              </div>
             </div>
-          </div>
-        )}
-      </div>
-    </div>
-  )
-}
-
-// ── Inline SVG icons (no icon library needed) ──────────────────────────────────
-
-function CopyIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
-      <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
-    </svg>
-  )
-}
-
-function RegenerateIcon() {
-  return (
-    <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-      <polyline points="1 4 1 10 7 10" />
-      <path d="M3.51 15a9 9 0 1 0 .49-3.5" />
-    </svg>
-  )
-}
-
-function StopIcon() {
-  return (
-    <svg width="10" height="10" viewBox="0 0 24 24" fill="currentColor">
-      <rect x="3" y="3" width="18" height="18" rx="2" />
-    </svg>
+          </aside>
+        </div>
+      </section>
+    </main>
   )
 }

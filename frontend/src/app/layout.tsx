@@ -6,14 +6,14 @@ const inter = Inter({ subsets: ['latin'] })
 
 export const metadata: Metadata = {
   title: 'PatchBrain',
-  description: 'AI-powered document intelligence for oilfield operations',
+  description: 'Oilfield operations intelligence from company documents',
 }
 
 export default function RootLayout({
   children,
-}: {
+}: Readonly<{
   children: React.ReactNode
-}) {
+}>) {
   return (
     <html lang="en">
       <body className={inter.className}>{children}</body>
