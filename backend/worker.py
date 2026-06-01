@@ -32,7 +32,7 @@ from parsers.docx_parser import parse_docx
 from parsers.whatsapp_parser import parse_whatsapp
 
 # Intelligence pass — runs after chunks are inserted, non-fatal
-from intelligence import run_intelligence_pass
+from intel_pass import run_intelligence_pass
 
 load_dotenv()
 
