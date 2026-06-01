@@ -662,15 +662,15 @@ def detect_entity_summary_intent(q: str) -> str | None:
     """Returns specific entity type ('truck','driver', etc.) for type-specific questions,
     'all' for broad summary questions, or None if not an entity summary intent."""
     ql = _normalize_question(q)
-    # Broad summary questions → return 'all'
-    if any(p in ql for p in ENTITY_SUMMARY_PATTERNS):
-        return "all"
-    # Type-specific questions → return the entity type
+    # Check type-specific FIRST so "what trucks are in the system?" → 'truck', not 'all'
     for etype, keywords in _ENTITY_TYPE_KEYWORDS.items():
         for kw in keywords:
             if (f"what {kw}" in ql or f"list {kw}" in ql or f"show {kw}" in ql
                     or f"how many {kw}" in ql):
                 return etype
+    # Broad summary questions → return 'all'
+    if any(p in ql for p in ENTITY_SUMMARY_PATTERNS):
+        return "all"
     return None
 
 
@@ -793,6 +793,19 @@ async def run_entity_summary(company_id: uuid.UUID, entity_type_filter: str = "a
 
 
 async def run_entity_lookup(company_id: uuid.UUID, search_term: str) -> str:
+    try:
+        return await _run_entity_lookup_inner(company_id, search_term)
+    except Exception as e:
+        import traceback as _tb
+        print(f"run_entity_lookup error for {search_term!r}: {e}")
+        _tb.print_exc()
+        return (
+            f"[entity-intel-v2] Error looking up **\"{search_term}\"**: {str(e)[:200]}\n\n"
+            "The entity index may still be building. Try again in a moment."
+        )
+
+
+async def _run_entity_lookup_inner(company_id: uuid.UUID, search_term: str) -> str:
     cid_str = str(company_id)
     search_lower = search_term.lower().strip()
 
@@ -933,6 +946,16 @@ async def run_entity_lookup(company_id: uuid.UUID, search_term: str) -> str:
 
 
 async def run_entity_files(company_id: uuid.UUID, search_term: str) -> str:
+    try:
+        return await _run_entity_files_inner(company_id, search_term)
+    except Exception as e:
+        import traceback as _tb
+        print(f"run_entity_files error for {search_term!r}: {e}")
+        _tb.print_exc()
+        return f"[entity-intel-v2] Error searching files for **\"{search_term}\"**: {str(e)[:200]}"
+
+
+async def _run_entity_files_inner(company_id: uuid.UUID, search_term: str) -> str:
     """Return files mentioning an entity — combines entity_mentions index AND full-text chunk search."""
     cid_str = str(company_id)
     search_lower = search_term.lower().strip()
@@ -1226,6 +1249,16 @@ async def run_needs_review(company_id: uuid.UUID) -> str:
 
 
 async def run_risk_summary(company_id: uuid.UUID, risk_filter: str) -> str:
+    try:
+        return await _run_risk_summary_inner(company_id, risk_filter)
+    except Exception as e:
+        import traceback as _tb
+        print(f"run_risk_summary error (filter={risk_filter!r}): {e}")
+        _tb.print_exc()
+        return f"[intel-v2] Error loading risk summary: {str(e)[:200]}"
+
+
+async def _run_risk_summary_inner(company_id: uuid.UUID, risk_filter: str) -> str:
     cid_str = str(company_id)
 
     if DB_POOL:
@@ -3216,3 +3249,4 @@ async def suggest_followups(b: FollowUpBody, u=Depends(get_user)):
         return {"suggestions": suggestions[:3] if isinstance(suggestions, list) else []}
     except Exception:
         return {"suggestions": []}
+ 
