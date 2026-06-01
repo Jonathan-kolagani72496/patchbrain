@@ -25,6 +25,7 @@ import anthropic
 import httpx
 
 from calc_tool import detect_calc_intent, run_structured_calc
+from issue_rules import run_issue_detection
 
 load_dotenv()
 
@@ -1555,6 +1556,84 @@ async def _dispatch_intel_intent(q: str, company_id: uuid.UUID) -> tuple[str, st
         return None
 
 
+def detect_operational_issues_intent(q: str) -> str | None:
+    """Return intent subtype if question is about operational issues, else None."""
+    ql = q.lower()
+    issue_triggers = [
+        "operational issue", "what issues", "any issues", "list issues",
+        "show issues", "show me issues", "issues do we have", "issues need review",
+        "what issue", "show candidate", "show confirmed", "show high severity",
+        "show open issues", "open issues", "current issues",
+    ]
+    if not any(t in ql for t in issue_triggers):
+        return None
+    if any(t in ql for t in ["cert", "certification", "expired cert", "hazmat", "safety cert"]):
+        return "expired_cert"
+    if any(t in ql for t in ["missing po", "po reference", "purchase order", " po "]):
+        return "missing_po"
+    if any(t in ql for t in ["spill", "incident followup", "spill incident"]):
+        return "spill"
+    return "summary"
+
+
+async def run_operational_issues_answer(company_id: uuid.UUID, intent_subtype: str) -> str:
+    """Return a formatted markdown table of operational issues."""
+    _RULE_KEY_MAP = {
+        "expired_cert": "expired_hazmat_or_safety_cert_driver_used",
+        "missing_po": "missing_po_reference",
+        "spill": "spill_incident_followup",
+    }
+    rule_key_filter = _RULE_KEY_MAP.get(intent_subtype)
+    issues = []
+    try:
+        if DB_POOL:
+            async with DB_POOL.acquire() as c:
+                if rule_key_filter:
+                    rows = await c.fetch(
+                        "SELECT severity, title, rule_key, status, created_at "
+                        "FROM operational_issues WHERE company_id=$1 AND rule_key=$2 "
+                        "ORDER BY created_at DESC LIMIT 20",
+                        company_id, rule_key_filter,
+                    )
+                else:
+                    rows = await c.fetch(
+                        "SELECT severity, title, rule_key, status, created_at "
+                        "FROM operational_issues WHERE company_id=$1 "
+                        "ORDER BY created_at DESC LIMIT 20",
+                        company_id,
+                    )
+                issues = [dict(r) for r in rows]
+        else:
+            sb = _sb()
+            q2 = (sb.table("operational_issues")
+                  .select("severity,title,rule_key,status,created_at")
+                  .eq("company_id", str(company_id)))
+            if rule_key_filter:
+                q2 = q2.eq("rule_key", rule_key_filter)
+            issues = q2.order("created_at", desc=True).limit(20).execute().data or []
+    except Exception as e:
+        return f"[issues-v1] Error retrieving operational issues: {e}"
+
+    if not issues:
+        return (
+            "[issues-v1] No operational issues found.\n\n"
+            "Use **POST /issues/run-detection** to generate candidates from uploaded files."
+        )
+
+    lines = [
+        "[issues-v1] Operational Issues\n",
+        "| Severity | Issue | Rule | Status |",
+        "|---|---|---|---|",
+    ]
+    for issue in issues:
+        sev   = issue.get("severity") or ""
+        title = (issue.get("title") or "").replace("|", "-")
+        rkey  = issue.get("rule_key") or ""
+        st    = issue.get("status") or ""
+        lines.append(f"| {sev} | {title} | {rkey} | {st} |")
+    return "\n".join(lines)
+
+
 def _clean_extracted_term(term: str) -> str:
     """Strip surrounding quotes, trailing punctuation, and noise words from extracted search terms."""
     if not term:
@@ -2581,6 +2660,19 @@ async def ask(b: AskBody, u=Depends(get_user)):
             headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
+    # Operational issues intents: answer from operational_issues table, not RAG.
+    issues_intent = detect_operational_issues_intent(q)
+    if issues_intent is not None:
+        issues_answer = await run_operational_issues_answer(cid, issues_intent)
+        return StreamingResponse(
+            _stream_direct_answer(
+                sid, cid, uid, q, issues_answer, new_count, history, srow, started_at,
+                intent_type="operational_issues",
+            ),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
+
     # Deterministic tools: exact counts/searches should use SQL/Python, not Claude.
     deterministic_intent = _detect_deterministic_tool_intent(q)
     if deterministic_intent:
@@ -2921,6 +3013,165 @@ async def get_chunk_evidence(chunk_id: str, u=Depends(get_user)):
         "contextualized_at": chunk.get("contextualized_at"),
         "file_version_created_at": version_row.get("created_at"),
     }
+
+
+# ── Operational Issues endpoints ─────────────────────────────────────────────
+
+class IssueStatusBody(BaseModel):
+    status: str
+
+class RunDetectionBody(BaseModel):
+    file_version_id: Optional[str] = None
+
+@app.post("/issues/run-detection")
+async def post_run_detection(body: RunDetectionBody = RunDetectionBody(), u=Depends(get_user)):
+    cid_str = str(u["company_id"])
+    sb = _sb()
+    fvid = body.file_version_id or None
+    result = await asyncio.get_event_loop().run_in_executor(
+        None, run_issue_detection, sb, cid_str, fvid
+    )
+    return {"status": "ok", "result": result}
+
+@app.get("/issues")
+async def get_issues(
+    status: Optional[str] = None,
+    issue_type: Optional[str] = None,
+    severity: Optional[str] = None,
+    rule_key: Optional[str] = None,
+    limit: int = 50,
+    include_evidence: bool = False,
+    u=Depends(get_user),
+):
+    cid = uuid.UUID(str(u["company_id"]))
+    issues = []
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            filters = ["company_id=$1"]
+            params: list = [cid]
+            idx = 2
+            if status is not None:
+                filters.append(f"status=${idx}"); params.append(status); idx += 1
+            if severity is not None:
+                filters.append(f"severity=${idx}"); params.append(severity); idx += 1
+            if issue_type is not None:
+                filters.append(f"issue_type=${idx}"); params.append(issue_type); idx += 1
+            if rule_key is not None:
+                filters.append(f"rule_key=${idx}"); params.append(rule_key); idx += 1
+            params.append(min(limit, 200))
+            where = " AND ".join(filters)
+            rows = await c.fetch(
+                f"SELECT * FROM operational_issues WHERE {where} ORDER BY created_at DESC LIMIT ${idx}",
+                *params,
+            )
+            issues = [dict(r) for r in rows]
+            if include_evidence and issues:
+                issue_ids = [uuid.UUID(str(i["id"])) for i in issues]
+                placeholders = ",".join(f"${j+1}" for j in range(len(issue_ids)))
+                ev_rows = await c.fetch(
+                    f"SELECT * FROM issue_evidence WHERE issue_id IN ({placeholders})",
+                    *issue_ids,
+                )
+                ev_map: dict = {}
+                for ev in ev_rows:
+                    d = dict(ev)
+                    ev_map.setdefault(str(d["issue_id"]), []).append(d)
+                for issue in issues:
+                    issue["evidence"] = ev_map.get(str(issue["id"]), [])
+    else:
+        sb = _sb()
+        q = sb.table("operational_issues").select("*").eq("company_id", str(cid))
+        if status is not None:
+            q = q.eq("status", status)
+        if severity is not None:
+            q = q.eq("severity", severity)
+        if issue_type is not None:
+            q = q.eq("issue_type", issue_type)
+        if rule_key is not None:
+            q = q.eq("rule_key", rule_key)
+        issues = q.order("created_at", desc=True).limit(min(limit, 200)).execute().data or []
+        if include_evidence and issues:
+            issue_ids = [str(i["id"]) for i in issues]
+            ev_res = sb.table("issue_evidence").select("*").in_("issue_id", issue_ids).execute()
+            ev_map2: dict = {}
+            for ev in (ev_res.data or []):
+                ev_map2.setdefault(str(ev["issue_id"]), []).append(ev)
+            for issue in issues:
+                issue["evidence"] = ev_map2.get(str(issue["id"]), [])
+    return issues
+
+@app.get("/issues/{issue_id}")
+async def get_issue(issue_id: str, u=Depends(get_user)):
+    cid = uuid.UUID(str(u["company_id"]))
+    issue = None
+    evidence = []
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            row = await c.fetchrow(
+                "SELECT * FROM operational_issues WHERE id=$1",
+                uuid.UUID(issue_id),
+            )
+            if row is None or uuid.UUID(str(row["company_id"])) != cid:
+                raise HTTPException(404, "Issue not found")
+            issue = dict(row)
+            ev_rows = await c.fetch(
+                "SELECT * FROM issue_evidence WHERE issue_id=$1 ORDER BY created_at",
+                uuid.UUID(issue_id),
+            )
+            evidence = [dict(r) for r in ev_rows]
+    else:
+        sb = _sb()
+        res = sb.table("operational_issues").select("*").eq("id", issue_id).execute()
+        if not res.data or uuid.UUID(str(res.data[0]["company_id"])) != cid:
+            raise HTTPException(404, "Issue not found")
+        issue = res.data[0]
+        ev_res = sb.table("issue_evidence").select("*").eq("issue_id", issue_id).execute()
+        evidence = ev_res.data or []
+    issue["evidence"] = evidence
+    return issue
+
+@app.post("/issues/{issue_id}/status")
+async def update_issue_status(issue_id: str, body: IssueStatusBody, u=Depends(get_user)):
+    cid = uuid.UUID(str(u["company_id"]))
+    valid_statuses = {"candidate", "confirmed", "dismissed", "resolved", "ignored"}
+    if body.status not in valid_statuses:
+        raise HTTPException(400, f"Invalid status. Must be one of: {', '.join(sorted(valid_statuses))}")
+    now = datetime.utcnow()
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            row = await c.fetchrow(
+                "SELECT company_id FROM operational_issues WHERE id=$1",
+                uuid.UUID(issue_id),
+            )
+            if row is None or uuid.UUID(str(row["company_id"])) != cid:
+                raise HTTPException(404, "Issue not found")
+            if body.status == "resolved":
+                await c.execute(
+                    "UPDATE operational_issues SET status=$1, updated_at=$2, resolved_at=$3 WHERE id=$4",
+                    body.status, now, now, uuid.UUID(issue_id),
+                )
+            elif body.status in ("candidate", "confirmed"):
+                await c.execute(
+                    "UPDATE operational_issues SET status=$1, updated_at=$2, resolved_at=NULL WHERE id=$3",
+                    body.status, now, uuid.UUID(issue_id),
+                )
+            else:
+                await c.execute(
+                    "UPDATE operational_issues SET status=$1, updated_at=$2 WHERE id=$3",
+                    body.status, now, uuid.UUID(issue_id),
+                )
+    else:
+        sb = _sb()
+        check = sb.table("operational_issues").select("company_id").eq("id", issue_id).execute()
+        if not check.data or uuid.UUID(str(check.data[0]["company_id"])) != cid:
+            raise HTTPException(404, "Issue not found")
+        payload: dict = {"status": body.status, "updated_at": now.isoformat()}
+        if body.status == "resolved":
+            payload["resolved_at"] = now.isoformat()
+        elif body.status in ("candidate", "confirmed"):
+            payload["resolved_at"] = None
+        sb.table("operational_issues").update(payload).eq("id", issue_id).execute()
+    return {"id": issue_id, "status": body.status}
 
 
 # ── File intelligence endpoints ───────────────────────────────────────────────

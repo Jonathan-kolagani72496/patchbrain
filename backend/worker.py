@@ -467,6 +467,16 @@ def process_job(sb: Client, job: dict):
     )
     # ─────────────────────────────────────────────────────────────────────────
 
+    # ── Issue detection (non-fatal) ───────────────────────────────────────────
+    # Runs after intelligence pass. Failures do NOT affect file status or job.
+    try:
+        from issue_rules import run_issue_detection
+        det_summary = run_issue_detection(sb=sb, company_id=company_id, file_version_id=version_id)
+        print(f"  Issue detection: {det_summary}")
+    except Exception as _ie:
+        print(f"  Issue detection failed (non-fatal): {_ie}")
+    # ─────────────────────────────────────────────────────────────────────────
+
     sb.table("processing_jobs")\
         .update({"status": "done", "updated_at": "now()"})\
         .eq("id", job["id"])\
