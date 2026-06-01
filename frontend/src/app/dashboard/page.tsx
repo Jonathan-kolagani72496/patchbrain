@@ -565,14 +565,42 @@ export default function DashboardPage() {
             </div>
 
             {/* Nav */}
-            <nav style={{ display: 'flex', alignItems: 'center', gap: 6 }} aria-label="Main navigation">
+            <nav style={{ display: 'flex', alignItems: 'center', gap: 4 }} aria-label="Main navigation">
+              {/* Page tabs */}
+              {([
+                { label: 'Files',    href: '/dashboard' },
+                { label: 'Library',  href: '/dashboard/library' },
+                { label: 'Entities', href: '/dashboard/entities' },
+                { label: 'Issues',   href: '/dashboard/issues' },
+              ] as const).map(item => (
+                <button
+                  key={item.href}
+                  onClick={() => router.push(item.href)}
+                  className="focus-ring"
+                  style={{
+                    padding: '5px 12px', borderRadius: 7, fontSize: 13,
+                    fontWeight: item.href === '/dashboard' ? 600 : 400,
+                    color: item.href === '/dashboard' ? '#fdba74' : 'var(--fg-muted)',
+                    background: item.href === '/dashboard' ? 'rgba(249,115,22,0.08)' : 'transparent',
+                    border: `1px solid ${item.href === '/dashboard' ? 'rgba(249,115,22,0.2)' : 'transparent'}`,
+                    cursor: 'pointer', transition: 'all 0.15s ease',
+                  }}
+                  onMouseEnter={e => { if (item.href !== '/dashboard') e.currentTarget.style.color = 'var(--fg)' }}
+                  onMouseLeave={e => { if (item.href !== '/dashboard') e.currentTarget.style.color = 'var(--fg-muted)' }}
+                >
+                  {item.label}
+                </button>
+              ))}
+
+              <div style={{ width: 1, height: 20, background: 'var(--border)', margin: '0 4px' }} />
+
               <button
                 onClick={() => loadFiles(true)}
                 className="focus-ring"
                 aria-label="Refresh file list"
                 style={{
                   display: 'flex', alignItems: 'center', gap: 5,
-                  padding: '6px 12px', borderRadius: 8, fontSize: 13, fontWeight: 500,
+                  padding: '6px 10px', borderRadius: 8, fontSize: 13, fontWeight: 500,
                   color: 'var(--fg-muted)', background: 'transparent',
                   border: '1px solid var(--border)', cursor: 'pointer',
                   transition: 'all 0.15s ease',

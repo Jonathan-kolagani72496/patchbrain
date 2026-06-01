@@ -528,7 +528,8 @@ def _run_compare_calc(q: str, records: list[dict], entities: list[str], metric_k
     for item in results:
         examples = "; ".join(_source_label(r) for r in item["rows"][:5])
         lines.append(f"- {item['entity']}: {_format_value(numeric_field, item['total'], metric_kind)} ({len(item['rows'])} row{'s' if len(item['rows']) != 1 else ''})" + (f" — sources: {examples}" if examples else ""))
-    lines.extend(["", f"Difference: {_format_value(numeric_field, diff, metric_kind)}", f"Higher: {leader['entity']}"])
+    result_line = "Result: tie" if diff == 0 else f"Higher: {leader['entity']}"
+    lines.extend(["", f"Difference: {_format_value(numeric_field, diff, metric_kind)}", result_line])
     return "\n".join(lines)
 
 
