@@ -839,32 +839,53 @@ async def _run_entity_lookup_inner(company_id: uuid.UUID, search_term: str) -> s
             )
             mentions = [dict(r) for r in rows]
 
-            # Risk flags from file_intelligence
-            risk_rows = await c.fetch(
-                """
-                select fi.risk_flags, fv.original_filename
-                from file_intelligence fi
-                join file_versions fv on fv.id = fi.file_version_id
-                where fi.company_id = $1
-                  and fi.short_summary ilike $2
-                limit 10
-                """,
-                company_id, f"%{search_lower}%",
-            )
-            risk_data = [dict(r) for r in risk_rows]
+            # Risk flags from file_intelligence (non-fatal — table may not exist)
+            try:
+                risk_rows = await c.fetch(
+                    """
+                    select fi.risk_flags, fv.original_filename
+                    from file_intelligence fi
+                    join file_versions fv on fv.id = fi.file_version_id
+                    where fi.company_id = $1
+                      and fi.short_summary ilike $2
+                    limit 10
+                    """,
+                    company_id, f"%{search_lower}%",
+                )
+                risk_data = [dict(r) for r in risk_rows]
+            except Exception as _re:
+                print(f"run_entity_lookup risk_data fetch failed (non-fatal): {_re}")
+                risk_data = []
     else:
         sb = _sb()
         mentions = []
         for variant in search_variants:
-            res = (
-                sb.table("entity_mentions")
-                .select("entity_type,canonical_value,value,source_field,source_row,confidence_score,file_version_id")
-                .eq("company_id", cid_str)
-                .ilike("canonical_value", f"%{variant}%")
-                .limit(200)
-                .execute()
-                .data or []
-            )
+            try:
+                # ilike for partial match (may time out on large tables without index)
+                res = (
+                    sb.table("entity_mentions")
+                    .select("entity_type,canonical_value,value,source_field,source_row,confidence_score,file_version_id")
+                    .eq("company_id", cid_str)
+                    .ilike("canonical_value", f"%{variant}%")
+                    .limit(200)
+                    .execute()
+                    .data or []
+                )
+            except Exception as _ie:
+                print(f"entity_mentions ilike failed for {variant!r}, trying exact eq: {_ie}")
+                try:
+                    # Exact eq fallback — fast, works well for entity IDs like T-04
+                    res = (
+                        sb.table("entity_mentions")
+                        .select("entity_type,canonical_value,value,source_field,source_row,confidence_score,file_version_id")
+                        .eq("company_id", cid_str)
+                        .eq("canonical_value", variant)
+                        .limit(200)
+                        .execute()
+                        .data or []
+                    )
+                except Exception:
+                    res = []
             if res:
                 mentions = res
                 break
@@ -3249,4 +3270,42 @@ async def suggest_followups(b: FollowUpBody, u=Depends(get_user)):
         return {"suggestions": suggestions[:3] if isinstance(suggestions, list) else []}
     except Exception:
         return {"suggestions": []}
- 
+        _sb().table("rag_query_logs")
+        .select("*")
+        .eq("company_id", str(cid))
+        .order("created_at", desc=True)
+        .limit(limit)
+        .execute()
+        .data
+        or []
+    )
+    return rows
+
+@app.get("/conflicts")
+async def list_conflicts(u=Depends(get_user)):
+    cid = str(u["company_id"])
+    sb = _sb()
+    rows = sb.table("data_conflicts") \
+        .select("*") \
+        .eq("company_id", cid) \
+        .order("created_at", desc=True) \
+        .limit(100) \
+        .execute().data or []
+    return rows
+
+class FollowUpBody(BaseModel):
+    question: str
+    answer: str
+
+@app.post("/suggest-followups")
+async def suggest_followups(b: FollowUpBody, u=Depends(get_user)):
+    try:
+        r = await ant.messages.create(
+            model="claude-haiku-4-5-20251001", max_tokens=120,
+            messages=[{"role": "user", "content":
+                f"Given this Q&A about oilfield documents, suggest 3 short follow-up questions (max 8 words each). Return ONLY a JSON array of strings, nothing else.\n\nQ: {b.question}\nA: {b.answer[:400]}"}])
+        raw = r.content[0].text.strip().lstrip('```json').rstrip('```').strip()
+        suggestions = json.loads(raw)
+        return {"suggestions": suggestions[:3] if isinstance(suggestions, list) else []}
+    except Exception:
+        return {"suggestions": []}
