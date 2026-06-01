@@ -659,15 +659,18 @@ _ENTITY_TYPE_KEYWORDS: dict[str, list[str]] = {
 
 
 def detect_entity_summary_intent(q: str) -> str | None:
+    """Returns specific entity type ('truck','driver', etc.) for type-specific questions,
+    'all' for broad summary questions, or None if not an entity summary intent."""
     ql = _normalize_question(q)
+    # Broad summary questions → return 'all'
     if any(p in ql for p in ENTITY_SUMMARY_PATTERNS):
-        return "entity_summary"
-    # "what X are in the system" / "list all X" patterns for entity types
+        return "all"
+    # Type-specific questions → return the entity type
     for etype, keywords in _ENTITY_TYPE_KEYWORDS.items():
         for kw in keywords:
             if (f"what {kw}" in ql or f"list {kw}" in ql or f"show {kw}" in ql
                     or f"how many {kw}" in ql):
-                return "entity_summary"
+                return etype
     return None
 
 
@@ -697,13 +700,25 @@ def detect_entity_files_intent(q: str) -> tuple[str, str] | None:
     return None
 
 
-async def run_entity_summary(company_id: uuid.UUID) -> str:
+async def run_entity_summary(company_id: uuid.UUID, entity_type_filter: str = "all") -> str:
+    """Return entity summary. entity_type_filter: specific type like 'truck', or 'all'."""
     types_to_count = ["truck", "driver", "client", "lease", "ticket_id", "invoice_id", "po_number", "job_id"]
     label_map = {
         "truck": "Trucks", "driver": "Drivers", "client": "Clients",
         "lease": "Leases", "ticket_id": "Ticket IDs", "invoice_id": "Invoice IDs",
         "po_number": "PO Numbers", "job_id": "Job IDs",
     }
+    label_singular = {
+        "truck": "truck", "driver": "driver", "client": "client",
+        "lease": "lease", "ticket_id": "ticket ID", "invoice_id": "invoice ID",
+        "po_number": "PO number", "job_id": "job ID",
+    }
+
+    query_types = (
+        [entity_type_filter]
+        if entity_type_filter != "all" and entity_type_filter in types_to_count
+        else types_to_count
+    )
 
     if DB_POOL:
         async with DB_POOL.acquire() as c:
@@ -716,14 +731,14 @@ async def run_entity_summary(company_id: uuid.UUID) -> str:
                   and entity_type = any($2::text[])
                 group by entity_type
                 """,
-                company_id, types_to_count,
+                company_id, query_types,
             )
             raw = {r["entity_type"]: {"count": r["cnt"], "examples": list(r["examples"] or [])} for r in rows}
     else:
         sb = _sb()
         cid_str = str(company_id)
         raw: dict = {}
-        for etype in types_to_count:
+        for etype in query_types:
             try:
                 res = (
                     sb.table("entity_mentions")
@@ -737,20 +752,43 @@ async def run_entity_summary(company_id: uuid.UUID) -> str:
             except Exception:
                 raw[etype] = {"count": 0, "examples": []}
 
-    has_data = any(v["count"] > 0 for v in raw.values())
-    if not has_data:
-        return "[entity-intel-v1] No entity data found. Make sure files have been processed by the intel pass."
+    # ── Type-specific response ────────────────────────────────────────────────
+    if entity_type_filter != "all" and entity_type_filter in types_to_count:
+        info = raw.get(entity_type_filter, {"count": 0, "examples": []})
+        label = label_map.get(entity_type_filter, entity_type_filter.title())
+        sing  = label_singular.get(entity_type_filter, entity_type_filter)
+        if info["count"] == 0:
+            return f"[entity-intel-v2] No {sing}s found in the entity index. Files may not have been processed yet."
+        examples = info["examples"]
+        lines = [f"## {label} in the system", ""]
+        for e in examples[:30]:
+            lines.append(f"- {e}")
+        if info["count"] > 30:
+            lines.append(f"- *(+{info['count'] - 30} more)*")
+        lines.append("")
+        lines.append(f"**{info['count']} unique {sing}{'s' if info['count'] != 1 else ''} found.**")
+        if examples:
+            lines.append(f"\nAsk: *show everything about {examples[0]}* for details.")
+        return "\n".join(lines)
 
-    lines = ["[entity-intel-v1] Entity summary for your company:", ""]
+    # ── Full summary ──────────────────────────────────────────────────────────
+    has_data = any(v.get("count", 0) > 0 for v in raw.values())
+    if not has_data:
+        return "[entity-intel-v2] No entity data found. Make sure files have been processed by the intel pass."
+
+    lines = ["## Entity summary", ""]
+    lines.append("| Type | Unique | Examples |")
+    lines.append("|------|:------:|---------|")
     for etype in types_to_count:
         info = raw.get(etype, {"count": 0, "examples": []})
         if info["count"] == 0:
             continue
-        examples = info["examples"][:5]
+        examples = info["examples"][:3]
         sample = ", ".join(str(e) for e in examples)
         more = f" (+{info['count'] - len(examples)} more)" if info["count"] > len(examples) else ""
-        lines.append(f"**{label_map[etype]}**: {info['count']} unique — e.g. {sample}{more}")
-    lines.append("\nAsk about any entity: 'show everything about T-04' or 'which files mention Carlos Mendez'")
+        lines.append(f"| {label_map[etype]} | {info['count']} | {sample}{more} |")
+    lines.append("")
+    lines.append("*Ask: 'show everything about T-04' or 'which files mention Carlos Mendez'*")
     return "\n".join(lines)
 
 
@@ -758,20 +796,33 @@ async def run_entity_lookup(company_id: uuid.UUID, search_term: str) -> str:
     cid_str = str(company_id)
     search_lower = search_term.lower().strip()
 
+    # Build normalized variants for entity-like tokens (T-04 → t04, t-04, t 04)
+    search_variants = [search_lower]
+    dehyphen = search_lower.replace("-", "").replace(" ", "")
+    rehyphen = re.sub(r"([a-z]+)(\d+)", r"\1-\2", dehyphen)
+    for v in [dehyphen, rehyphen]:
+        if v and v != search_lower:
+            search_variants.append(v)
+
     if DB_POOL:
         async with DB_POOL.acquire() as c:
+            conditions = " or ".join(
+                f"(lower(em.canonical_value) ilike ${2+i} or lower(em.value) ilike ${2+i})"
+                for i in range(len(search_variants))
+            )
+            params: list = [company_id] + [f"%{v}%" for v in search_variants]
             rows = await c.fetch(
-                """
+                f"""
                 select em.entity_type, em.canonical_value, em.value, em.source_field,
                        em.source_row, em.confidence_score, fv.original_filename, em.file_version_id
                 from entity_mentions em
                 join file_versions fv on fv.id = em.file_version_id
                 where em.company_id = $1
-                  and (lower(em.canonical_value) ilike $2 or lower(em.value) ilike $2)
+                  and ({conditions})
                 order by em.entity_type, em.canonical_value
                 limit 200
                 """,
-                company_id, f"%{search_lower}%",
+                *params,
             )
             mentions = [dict(r) for r in rows]
 
@@ -790,15 +841,20 @@ async def run_entity_lookup(company_id: uuid.UUID, search_term: str) -> str:
             risk_data = [dict(r) for r in risk_rows]
     else:
         sb = _sb()
-        mentions = (
-            sb.table("entity_mentions")
-            .select("entity_type,canonical_value,value,source_field,source_row,confidence_score,file_version_id")
-            .eq("company_id", cid_str)
-            .ilike("canonical_value", f"%{search_lower}%")
-            .limit(200)
-            .execute()
-            .data or []
-        )
+        mentions = []
+        for variant in search_variants:
+            res = (
+                sb.table("entity_mentions")
+                .select("entity_type,canonical_value,value,source_field,source_row,confidence_score,file_version_id")
+                .eq("company_id", cid_str)
+                .ilike("canonical_value", f"%{variant}%")
+                .limit(200)
+                .execute()
+                .data or []
+            )
+            if res:
+                mentions = res
+                break
         # Enrich with filenames
         fv_ids = list({str(m.get("file_version_id")) for m in mentions if m.get("file_version_id")})
         fname_map: dict = {}
@@ -817,8 +873,8 @@ async def run_entity_lookup(company_id: uuid.UUID, search_term: str) -> str:
 
     if not mentions:
         return (
-            f"[entity-intel-v1] No entity records found for \"{search_term}\". "
-            "Try exact match or use 'search for' to do a full text search."
+            f"[entity-intel-v2] No entity records found for **\"{search_term}\"**.\n\n"
+            "Try a broader search or use *'search for ...'* for full-text search."
         )
 
     # Group by entity_type
@@ -830,59 +886,58 @@ async def run_entity_lookup(company_id: uuid.UUID, search_term: str) -> str:
         fname = m.get("original_filename") or "unknown"
         by_file[fname] = by_file.get(fname, 0) + 1
 
-    canonical_values = sorted({m.get("canonical_value") for m in mentions if m.get("canonical_value")})
     lines = [
-        f"[entity-intel-v1] Entity lookup: **{search_term}**",
-        f"Found {len(mentions)} mention{'s' if len(mentions) != 1 else ''} across {len(by_file)} file{'s' if len(by_file) != 1 else ''}.",
+        f"## Entity: {search_term}",
         "",
+        f"Found **{len(mentions)} mention{'s' if len(mentions) != 1 else ''}** across **{len(by_file)} file{'s' if len(by_file) != 1 else ''}**.",
+        "",
+        "### Entity types",
     ]
 
-    lines.append("**Entity types:**")
     for etype, items in sorted(by_type.items()):
         canonical = sorted({i.get("canonical_value") for i in items if i.get("canonical_value")})
-        lines.append(f"- {etype}: {', '.join(canonical[:5])}" + (f" (+{len(canonical)-5} more)" if len(canonical) > 5 else ""))
+        lines.append(
+            f"- **{etype}**: {', '.join(canonical[:5])}"
+            + (f" (+{len(canonical)-5} more)" if len(canonical) > 5 else "")
+        )
 
     lines.append("")
-    lines.append("**Files containing this entity:**")
+    lines.append("### Files containing this entity")
     for fname, count in sorted(by_file.items(), key=lambda x: -x[1])[:10]:
-        lines.append(f"- {fname} ({count} mention{'s' if count != 1 else ''})")
+        lines.append(f"- {fname} — {count} mention{'s' if count != 1 else ''}")
 
     # Source previews
     preview_items = mentions[:3]
     if preview_items:
         lines.append("")
-        lines.append("**Sample source context:**")
+        lines.append("### Sample source context")
         for m in preview_items:
             field = m.get("source_field") or ""
-            row = m.get("source_row") or ""
-            loc = f" (field: {field}, row: {row})" if field or row else ""
-            lines.append(f"- {m.get('original_filename')}: \"{m.get('value')}\"{loc}")
+            row   = m.get("source_row") or ""
+            loc   = f" (field: {field}, row: {row})" if field or row else ""
+            lines.append(f"- {m.get('original_filename')}: `{m.get('value')}`{loc}")
 
     # Risk flags
     if risk_data:
         all_flags: list[str] = []
         for rd in risk_data:
-            flags = rd.get("risk_flags") or []
-            if isinstance(flags, list):
-                for f in flags:
-                    if isinstance(f, str):
-                        all_flags.append(f)
-                    elif isinstance(f, dict):
-                        all_flags.append(f.get("flag") or f.get("type") or str(f))
+            for f in _extract_risk_flags(rd.get("risk_flags")):
+                all_flags.append(f)
         if all_flags:
             lines.append("")
             lines.append(f"**Related risk flags:** {', '.join(sorted(set(all_flags))[:5])}")
 
     lines.append("")
-    lines.append(f"Follow-up ideas: 'which files mention {search_term}?' or 'show total revenue for {search_term}'")
+    lines.append(f"*Follow-up: 'which files mention {search_term}?' or 'show total revenue for {search_term}'*")
     return "\n".join(lines)
 
 
 async def run_entity_files(company_id: uuid.UUID, search_term: str) -> str:
-    """Return files mentioning an entity, preferring entity_mentions over full-text search."""
+    """Return files mentioning an entity — combines entity_mentions index AND full-text chunk search."""
     cid_str = str(company_id)
     search_lower = search_term.lower().strip()
 
+    # ── Entity index results ──────────────────────────────────────────────────
     if DB_POOL:
         async with DB_POOL.acquire() as c:
             rows = await c.fetch(
@@ -932,44 +987,70 @@ async def run_entity_files(company_id: uuid.UUID, search_term: str) -> str:
             for fn, v in sorted(agg.items(), key=lambda x: -x[1]["mention_count"])
         ]
 
-    if not entity_results:
-        # Fallback to full-text chunk search
-        chunk_rows = await _load_chunks_matching_term(str(company_id), search_term, limit=200)
-        if chunk_rows:
-            return _build_files_mentioning_answer(search_term, chunk_rows)
-        return f"[entity-intel-v1] No files found mentioning \"{search_term}\" in entity records or document text."
+    # ── Full-text chunk search (always run to catch PDF/email/TXT) ────────────
+    chunk_rows = await _load_chunks_matching_term(cid_str, search_term, limit=500)
+    text_by_file: dict[str, int] = {}
+    for row in chunk_rows:
+        fname = row.get("original_filename") or "Unnamed file"
+        count = max(_count_substring(row.get("content") or "", search_term), 1)
+        text_by_file[fname] = text_by_file.get(fname, 0) + count
 
-    lines = [
-        f"[entity-intel-v1] Files mentioning **{search_term}** (from entity index):",
-        "",
-    ]
-    for i, r in enumerate(entity_results[:20], 1):
-        etypes = ", ".join(r.get("entity_types") or [])
-        lines.append(
-            f"{i}. {r['original_filename']} — "
-            f"{r['mention_count']} mention{'s' if r['mention_count'] != 1 else ''}"
-            + (f" [{etypes}]" if etypes else "")
-        )
+    entity_filenames = {r["original_filename"] for r in entity_results}
+    text_only = {fn: cnt for fn, cnt in text_by_file.items() if fn not in entity_filenames}
+
+    if not entity_results and not text_by_file:
+        return f"[entity-intel-v2] No files found mentioning **\"{search_term}\"** in the entity index or document text."
+
+    lines = [f"## Files mentioning: {search_term}", ""]
+
+    if entity_results:
+        lines.append("**From entity index:**")
+        for r in entity_results[:20]:
+            etypes = ", ".join(r.get("entity_types") or [])
+            cnt = r["mention_count"]
+            lines.append(
+                f"- {r['original_filename']} — {cnt} mention{'s' if cnt != 1 else ''}"
+                + (f" [{etypes}]" if etypes else "")
+            )
+    else:
+        lines.append("*(No structured entity-index matches)*")
+
+    if text_only:
+        lines.append("")
+        lines.append("**Additional text matches:**")
+        for fn, cnt in sorted(text_only.items(), key=lambda x: -x[1])[:10]:
+            lines.append(f"- {fn} — {cnt} match{'es' if cnt != 1 else ''}")
+
+    total_files = len(entity_filenames | set(text_by_file.keys()))
+    lines.append("")
+    lines.append(f"*Total: {total_files} file{'s' if total_files != 1 else ''} mention \"{search_term}\".*")
     return "\n".join(lines)
 
 
 async def _dispatch_entity_intent(q: str, company_id: uuid.UUID) -> str | None:
     """Returns an answer string if the question is an entity intent, else None."""
-    # Order matters: files intent before lookup to avoid mis-routing
-    if detect_entity_summary_intent(q):
-        return await run_entity_summary(company_id)
+    try:
+        # Order matters: files intent before lookup to avoid mis-routing
+        entity_type = detect_entity_summary_intent(q)
+        if entity_type is not None:
+            return await run_entity_summary(company_id, entity_type_filter=entity_type)
 
-    files_intent = detect_entity_files_intent(q)
-    if files_intent:
-        _, term = files_intent
-        return await run_entity_files(company_id, term)
+        files_intent = detect_entity_files_intent(q)
+        if files_intent:
+            _, term = files_intent
+            return await run_entity_files(company_id, term)
 
-    lookup_intent = detect_entity_lookup_intent(q)
-    if lookup_intent:
-        _, term = lookup_intent
-        return await run_entity_lookup(company_id, term)
+        lookup_intent = detect_entity_lookup_intent(q)
+        if lookup_intent:
+            _, term = lookup_intent
+            return await run_entity_lookup(company_id, term)
 
-    return None
+        return None
+    except Exception as e:
+        print(f"_dispatch_entity_intent error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 # ── Risk/intel-aware intent detection (Task 2) ────────────────────────────────
@@ -1060,6 +1141,14 @@ def _extract_risk_flags(flags_raw) -> list[str]:
             flags_raw = json.loads(flags_raw)
         except Exception:
             return [flags_raw]
+    if isinstance(flags_raw, dict):
+        # Object wrapper: {"flags": [...]} or {"type": "..."}
+        inner = flags_raw.get("flags") or flags_raw.get("items") or flags_raw.get("details") or []
+        if isinstance(inner, list):
+            flags_raw = inner
+        else:
+            val = flags_raw.get("flag") or flags_raw.get("type") or flags_raw.get("name")
+            return [val] if val else []
     if not isinstance(flags_raw, list):
         return []
     out = []
@@ -1118,20 +1207,21 @@ async def run_needs_review(company_id: uuid.UUID) -> str:
             data.append(r)
 
     if not data:
-        return "[intel-v1] No files are currently flagged for review."
+        return "[intel-v2] No files are currently flagged for review."
 
-    lines = [f"[intel-v1] **{len(data)} file{'s' if len(data) != 1 else ''} need review:**", ""]
+    lines = [f"## Files needing review ({len(data)} file{'s' if len(data) != 1 else ''})", ""]
     for i, r in enumerate(data[:25], 1):
-        fname = r.get("original_filename") or "unknown"
-        cat = r.get("category") or ""
+        fname    = r.get("original_filename") or "unknown"
+        cat      = r.get("category") or ""
         doc_type = r.get("document_type") or ""
-        summary = (r.get("short_summary") or "")[:120]
-        flags = _extract_risk_flags(r.get("risk_flags"))
-        flag_str = f" — ⚠ {', '.join(flags[:3])}" if flags else ""
-        meta = " · ".join(x for x in [cat, doc_type] if x)
-        lines.append(f"{i}. **{fname}**" + (f" [{meta}]" if meta else "") + flag_str)
+        summary  = (r.get("short_summary") or "")[:120]
+        flags    = _extract_risk_flags(r.get("risk_flags"))
+        flag_str = f" ⚠ {', '.join(flags[:3])}" if flags else ""
+        meta     = " · ".join(x for x in [cat, doc_type] if x)
+        lines.append(f"**{i}. {fname}**" + (f" `[{meta}]`" if meta else "") + flag_str)
         if summary:
-            lines.append(f"   {summary}")
+            lines.append(f"   > {summary}")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -1148,7 +1238,8 @@ async def run_risk_summary(company_id: uuid.UUID, risk_filter: str) -> str:
                 join files f on f.id = fi.file_id
                 where fi.company_id = $1
                   and fi.risk_flags is not null
-                  and jsonb_array_length(fi.risk_flags) > 0
+                  and fi.risk_flags != 'null'::jsonb
+                  and fi.risk_flags != '[]'::jsonb
                   and f.deleted_at is null
                 limit 200
                 """,
@@ -1161,7 +1252,6 @@ async def run_risk_summary(company_id: uuid.UUID, risk_filter: str) -> str:
             sb.table("file_intelligence")
             .select("risk_flags,file_version_id")
             .eq("company_id", cid_str)
-            .not_.is_("risk_flags", "null")
             .order("created_at", desc=True)
             .limit(200)
             .execute()
@@ -1181,7 +1271,7 @@ async def run_risk_summary(company_id: uuid.UUID, risk_filter: str) -> str:
             data.append(r)
 
     if not data:
-        return "[intel-v1] No risk flags found in your files."
+        return "[intel-v2] No risk flags found in your files."
 
     # Aggregate: flag -> list of filenames
     flag_files: dict[str, list[str]] = {}
@@ -1192,20 +1282,34 @@ async def run_risk_summary(company_id: uuid.UUID, risk_filter: str) -> str:
             flag_files.setdefault(flag, []).append(fname)
 
     if not flag_files:
-        return "[intel-v1] Files have risk_flags set but no parseable flag values were found."
+        return "[intel-v2] Files have risk_flags recorded but no parseable flag values were found.\n\nCheck that the intel pass ran successfully after file processing."
 
     # Filter if specific risk type requested
     if risk_filter != "all":
         flag_files = {k: v for k, v in flag_files.items() if risk_filter.lower() in k.lower()}
         if not flag_files:
-            return f"[intel-v1] No \"{risk_filter}\" risk flags found in your files."
+            return f"[intel-v2] No **{risk_filter}** risk flags found in your files."
 
-    lines = [f"[intel-v1] **Risk flag summary** ({len(flag_files)} distinct flag type{'s' if len(flag_files) != 1 else ''}):", ""]
+    # Reverse map: filename -> list of flags
+    file_flags: dict[str, list[str]] = {}
+    for flag, files in flag_files.items():
+        for fn in files:
+            file_flags.setdefault(fn, []).append(flag)
+
+    lines = ["## Risk summary", ""]
+    lines.append("| Risk flag | Files affected |")
+    lines.append("|-----------|:--------------:|")
     for flag, files in sorted(flag_files.items(), key=lambda x: -len(x[1])):
-        unique_files = sorted(set(files))
-        examples = ", ".join(unique_files[:3]) + ("…" if len(unique_files) > 3 else "")
-        lines.append(f"- **{flag}**: {len(unique_files)} file{'s' if len(unique_files) != 1 else ''} — {examples}")
-    lines.append("\nAsk: 'which files need review?' or 'explain the missing PO issue in <filename>'")
+        lines.append(f"| {flag.replace('_', ' ')} | {len(set(files))} |")
+
+    lines.append("")
+    lines.append("### Affected files")
+    for fn, flags in sorted(file_flags.items()):
+        flag_str = ", ".join(sorted(set(flags)))
+        lines.append(f"- **{fn}** — {flag_str}")
+
+    lines.append("")
+    lines.append("*Ask: 'which files need review?' or 'explain the missing PO issue in \\<filename\\>'*")
     return "\n".join(lines)
 
 
@@ -1270,21 +1374,22 @@ async def run_intel_category_files(company_id: uuid.UUID, category: str) -> str:
 
     if not data:
         label = category.replace("_", " ") if category != "all" else ""
-        return f"[intel-v1] No {'`' + label + '`' if label else ''} files found in the intel index."
+        return f"[intel-v2] No {('**' + label + '**') if label else ''} files found in the intel index."
 
     label = category.replace("_", " ").title() if category != "all" else "All categories"
-    lines = [f"[intel-v1] **{label} files** ({len(data)} found):", ""]
+    lines = [f"## {label} files ({len(data)} found)", ""]
     for i, r in enumerate(data[:25], 1):
-        fname = r.get("original_filename") or "unknown"
-        cat = r.get("category") or ""
+        fname    = r.get("original_filename") or "unknown"
+        cat      = r.get("category") or ""
         doc_type = r.get("document_type") or ""
-        summary = (r.get("short_summary") or "")[:100]
-        flags = _extract_risk_flags(r.get("risk_flags"))
+        summary  = (r.get("short_summary") or "")[:100]
+        flags    = _extract_risk_flags(r.get("risk_flags"))
         flag_str = f" ⚠ {', '.join(flags[:2])}" if flags else ""
-        meta = " · ".join(x for x in [cat, doc_type] if x)
-        lines.append(f"{i}. **{fname}**" + (f" [{meta}]" if meta else "") + flag_str)
+        meta     = " · ".join(x for x in [cat, doc_type] if x)
+        lines.append(f"**{i}. {fname}**" + (f" `[{meta}]`" if meta else "") + flag_str)
         if summary:
-            lines.append(f"   {summary}")
+            lines.append(f"   > {summary}")
+        lines.append("")
     return "\n".join(lines)
 
 
@@ -1328,61 +1433,72 @@ async def run_file_intel_lookup(company_id: uuid.UUID, search_term: str) -> str:
             data.append(r)
 
     if not data:
-        return f"[intel-v1] No intel record found for \"{search_term}\". The file may not have been processed yet."
+        return f"[intel-v2] No intel record found for **\"{search_term}\"**.\n\nThe file may not have been processed yet, or try using part of the filename."
 
     lines = []
     for r in data[:3]:
         fname = r.get("original_filename") or "unknown"
-        lines.append(f"[intel-v1] **File intel: {fname}**")
+        lines.append(f"## File intel: {fname}")
         lines.append("")
         if r.get("category"):
-            lines.append(f"- **Category:** {r['category']}")
+            lines.append(f"- **Category:** {r['category'].replace('_', ' ').title()}")
         if r.get("document_type"):
-            lines.append(f"- **Document type:** {r['document_type']}")
+            lines.append(f"- **Document type:** {r['document_type'].replace('_', ' ').title()}")
         if r.get("short_summary"):
             lines.append(f"- **Summary:** {r['short_summary']}")
         if r.get("needs_review"):
             lines.append("- ⚠ **Flagged for review**")
         flags = _extract_risk_flags(r.get("risk_flags"))
         if flags:
-            lines.append(f"- **Risk flags:** {', '.join(flags)}")
+            lines.append(f"- **Risk flags:** {', '.join(f.replace('_', ' ') for f in flags)}")
         key_entities = r.get("key_entities")
         if key_entities:
-            if isinstance(key_entities, list):
+            if isinstance(key_entities, dict):
+                parts = []
+                for k, vals in key_entities.items():
+                    if vals:
+                        parts.append(f"{k}: {', '.join(str(v) for v in vals[:4])}")
+                if parts:
+                    lines.append(f"- **Key entities:** {'; '.join(parts[:5])}")
+            elif isinstance(key_entities, list):
                 lines.append(f"- **Key entities:** {', '.join(str(e) for e in key_entities[:10])}")
             elif isinstance(key_entities, str):
                 lines.append(f"- **Key entities:** {key_entities[:200]}")
         suggested = r.get("suggested_questions")
-        if suggested:
-            if isinstance(suggested, list):
-                lines.append("- **Suggested questions:**")
-                for sq in suggested[:3]:
-                    lines.append(f"  - {sq}")
+        if suggested and isinstance(suggested, list):
+            lines.append("")
+            lines.append("**Suggested questions:**")
+            for sq in suggested[:3]:
+                lines.append(f"- {sq}")
         lines.append("")
     return "\n".join(lines).strip()
 
 
 async def _dispatch_intel_intent(q: str, company_id: uuid.UUID) -> tuple[str, str] | None:
     """Returns (answer, intent_type) if question is an intel/risk intent, else None."""
-    ql = _normalize_question(q)
+    try:
+        if detect_needs_review_intent(q):
+            return (await run_needs_review(company_id), "needs_review_files")
 
-    if detect_needs_review_intent(q):
-        return (await run_needs_review(company_id), "needs_review_files")
+        risk_filter = detect_risk_summary_intent(q)
+        if risk_filter is not None:
+            intent = "risk_lookup" if risk_filter != "all" else "risk_summary"
+            return (await run_risk_summary(company_id, risk_filter), intent)
 
-    risk_filter = detect_risk_summary_intent(q)
-    if risk_filter is not None:
-        intent = "risk_lookup" if risk_filter != "all" else "risk_summary"
-        return (await run_risk_summary(company_id, risk_filter), intent)
+        cat = detect_intel_category_intent(q)
+        if cat is not None:
+            return (await run_intel_category_files(company_id, cat), "intel_category_files")
 
-    cat = detect_intel_category_intent(q)
-    if cat is not None:
-        return (await run_intel_category_files(company_id, cat), "intel_category_files")
+        file_term = detect_file_intel_lookup_intent(q)
+        if file_term:
+            return (await run_file_intel_lookup(company_id, file_term), "file_intel_lookup")
 
-    file_term = detect_file_intel_lookup_intent(q)
-    if file_term:
-        return (await run_file_intel_lookup(company_id, file_term), "file_intel_lookup")
-
-    return None
+        return None
+    except Exception as e:
+        print(f"_dispatch_intel_intent error: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
 
 
 def _clean_extracted_term(term: str) -> str:
@@ -1710,7 +1826,18 @@ async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) ->
         rows = await _load_chunks_matching_term(company_id, term)
 
         if tool_name == "exact_count":
-            return _build_exact_count_answer(term, rows)
+            base_answer = _build_exact_count_answer(term, rows)
+            # If raw count is 0, check entity_mentions as fallback for entity-like tokens
+            zero_result = (
+                "I found 0 occurrences" in base_answer
+                or "I found 0 standalone" in base_answer
+                or "Postgres found" in base_answer
+            )
+            if zero_result and _looks_like_entity_token(term):
+                entity_fallback = await _entity_mention_count_fallback(uuid.UUID(str(company_id)), term)
+                if entity_fallback:
+                    return entity_fallback
+            return base_answer
 
         if tool_name == "files_mentioning":
             return _build_files_mentioning_answer(term, rows)
@@ -1733,6 +1860,101 @@ async def _run_deterministic_tool(company_id: str, tool_name: str, term: str) ->
             f'I could not complete the exact search for "{term}". '
             "Please try rephrasing your question, or ask me to summarize documents instead."
         )
+
+
+# ── Entity-token helpers for exact_count fallback ─────────────────────────────
+
+def _looks_like_entity_token(term: str) -> bool:
+    """True if the term looks like a structured entity ID (T-04, FT-9001, Reeves 14H)
+    rather than a plain English word like 'time' or 'pump'."""
+    t = term.strip()
+    return bool(
+        re.search(r"[A-Za-z][-\s]?\d", t)          # letter then digit: T-04, Reeves 14H
+        or re.search(r"\d+[A-Za-z]$", t)            # digit-letter suffix: 14H
+        or re.fullmatch(r"[A-Z]{1,4}-?\d{2,}", t)  # pure ID: T-04, FT9001
+    )
+
+
+async def _entity_mention_count_fallback(company_id: uuid.UUID, term: str) -> str | None:
+    """Query entity_mentions when raw text count is 0 for an entity-like token.
+    Returns a formatted message, or None if no entity matches found."""
+    search_lower = term.lower().strip()
+    variants = [search_lower, search_lower.replace("-", ""), search_lower.replace("-", " ")]
+    variants = list(dict.fromkeys(variants))  # deduplicate, preserve order
+
+    try:
+        if DB_POOL:
+            async with DB_POOL.acquire() as c:
+                conditions = " or ".join(
+                    f"(lower(canonical_value) ilike ${2+i} or lower(value) ilike ${2+i})"
+                    for i in range(len(variants))
+                )
+                params: list = [company_id] + [f"%{v}%" for v in variants]
+                rows = await c.fetch(
+                    f"""
+                    select em.entity_type, em.canonical_value,
+                           count(*) as mention_count,
+                           count(distinct em.file_version_id) as file_count
+                    from entity_mentions em
+                    where em.company_id = $1
+                      and ({conditions})
+                    group by em.entity_type, em.canonical_value
+                    order by mention_count desc
+                    limit 20
+                    """,
+                    *params,
+                )
+                results = [dict(r) for r in rows]
+        else:
+            sb = _sb()
+            results = []
+            for v in variants:
+                res = (
+                    sb.table("entity_mentions")
+                    .select("entity_type,canonical_value,file_version_id")
+                    .eq("company_id", str(company_id))
+                    .ilike("canonical_value", f"%{v}%")
+                    .limit(200)
+                    .execute()
+                    .data or []
+                )
+                if res:
+                    agg: dict = {}
+                    for r in res:
+                        key = (r["entity_type"], r["canonical_value"])
+                        if key not in agg:
+                            agg[key] = {"mention_count": 0, "file_count": set()}
+                        agg[key]["mention_count"] += 1
+                        agg[key]["file_count"].add(r.get("file_version_id"))
+                    results = [
+                        {"entity_type": k[0], "canonical_value": k[1],
+                         "mention_count": v2["mention_count"], "file_count": len(v2["file_count"])}
+                        for k, v2 in agg.items()
+                    ]
+                    break
+
+        if not results:
+            return None
+
+        total_mentions = sum(r["mention_count"] for r in results)
+        lines = [
+            f"[deterministic-v7] Found **0 raw text occurrences** of \"{term}\" in document text.",
+            "",
+            f"However, the **entity index** contains **{total_mentions} mention{'s' if total_mentions != 1 else ''}**:",
+            "",
+        ]
+        for r in results[:10]:
+            lines.append(
+                f"- `{r['canonical_value']}` ({r['entity_type']}) — "
+                f"{r['mention_count']} mention{'s' if r['mention_count'] != 1 else ''} in {r['file_count']} file{'s' if r['file_count'] != 1 else ''}"
+            )
+        lines.append("")
+        lines.append("*Entity data is extracted from structured CSV/Excel fields — the term may not appear as literal text in PDFs or emails.*")
+        return "\n".join(lines)
+
+    except Exception as e:
+        print(f"_entity_mention_count_fallback error: {e}")
+        return None
 
 
 FILE_INVENTORY_PATTERNS = (
