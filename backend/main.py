@@ -622,6 +622,769 @@ def _detect_deterministic_tool_intent(q: str) -> tuple[str, str] | None:
     return None
 
 
+# ── Entity-aware intent detection (Task 1) ────────────────────────────────────
+
+ENTITY_SUMMARY_PATTERNS = (
+    "what trucks are in the system", "what drivers are in the system",
+    "what leases are in the system", "what clients are in the system",
+    "what invoice ids are in the system", "what ticket ids are in the system",
+    "what po numbers are in the system", "what job ids are in the system",
+    "list all trucks", "list all drivers", "list all leases", "list all clients",
+    "show all trucks", "show all drivers", "show all leases", "show all clients",
+    "how many trucks", "how many drivers", "how many leases", "how many clients",
+    "what entities are in the system", "show entities", "list entities",
+)
+
+ENTITY_LOOKUP_PATTERNS = (
+    "show everything about", "tell me everything about", "what do we know about",
+    "where does", "where do", "show me everything about", "what is known about",
+    "all mentions of", "all references to",
+)
+
+ENTITY_FILES_PATTERNS = (
+    "which files mention", "what files mention", "show files related to",
+    "files related to", "documents that mention", "which documents mention",
+    "files mentioning",
+)
+
+_ENTITY_TYPE_KEYWORDS: dict[str, list[str]] = {
+    "truck": ["truck", "trucks", "unit", "units"],
+    "driver": ["driver", "drivers"],
+    "client": ["client", "clients", "customer", "customers", "operator", "operators"],
+    "lease": ["lease", "leases", "well", "wells", "location", "locations", "site", "sites"],
+    "invoice_id": ["invoice id", "invoice ids", "invoices"],
+    "ticket_id": ["ticket id", "ticket ids", "tickets", "run tickets"],
+    "po_number": ["po number", "po numbers", "purchase orders"],
+}
+
+
+def detect_entity_summary_intent(q: str) -> str | None:
+    ql = _normalize_question(q)
+    if any(p in ql for p in ENTITY_SUMMARY_PATTERNS):
+        return "entity_summary"
+    # "what X are in the system" / "list all X" patterns for entity types
+    for etype, keywords in _ENTITY_TYPE_KEYWORDS.items():
+        for kw in keywords:
+            if (f"what {kw}" in ql or f"list {kw}" in ql or f"show {kw}" in ql
+                    or f"how many {kw}" in ql):
+                return "entity_summary"
+    return None
+
+
+def detect_entity_lookup_intent(q: str) -> tuple[str, str] | None:
+    ql = _normalize_question(q)
+    for p in ENTITY_LOOKUP_PATTERNS:
+        if p in ql:
+            after = q[q.lower().find(p) + len(p):].strip(" ?.,:")
+            if after:
+                return ("entity_lookup", after)
+    # "where does X appear?" pattern
+    m = re.search(r"where does?\s+(.+?)\s+(appear|show up|come from|get mentioned)", q, re.I)
+    if m:
+        return ("entity_lookup", m.group(1).strip())
+    return None
+
+
+def detect_entity_files_intent(q: str) -> tuple[str, str] | None:
+    ql = _normalize_question(q)
+    # Avoid stealing from entity_lookup
+    for p in ENTITY_FILES_PATTERNS:
+        if p in ql:
+            idx = q.lower().find(p)
+            after = q[idx + len(p):].strip(" ?.,:")
+            if after:
+                return ("entity_files", after)
+    return None
+
+
+async def run_entity_summary(company_id: uuid.UUID) -> str:
+    types_to_count = ["truck", "driver", "client", "lease", "ticket_id", "invoice_id", "po_number", "job_id"]
+    label_map = {
+        "truck": "Trucks", "driver": "Drivers", "client": "Clients",
+        "lease": "Leases", "ticket_id": "Ticket IDs", "invoice_id": "Invoice IDs",
+        "po_number": "PO Numbers", "job_id": "Job IDs",
+    }
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select entity_type, count(distinct canonical_value) as cnt,
+                       array_agg(distinct canonical_value order by canonical_value) as examples
+                from entity_mentions
+                where company_id = $1
+                  and entity_type = any($2::text[])
+                group by entity_type
+                """,
+                company_id, types_to_count,
+            )
+            raw = {r["entity_type"]: {"count": r["cnt"], "examples": list(r["examples"] or [])} for r in rows}
+    else:
+        sb = _sb()
+        cid_str = str(company_id)
+        raw: dict = {}
+        for etype in types_to_count:
+            try:
+                res = (
+                    sb.table("entity_mentions")
+                    .select("canonical_value")
+                    .eq("company_id", cid_str)
+                    .eq("entity_type", etype)
+                    .execute()
+                )
+                vals = sorted({r["canonical_value"] for r in (res.data or []) if r.get("canonical_value")})
+                raw[etype] = {"count": len(vals), "examples": vals}
+            except Exception:
+                raw[etype] = {"count": 0, "examples": []}
+
+    has_data = any(v["count"] > 0 for v in raw.values())
+    if not has_data:
+        return "[entity-intel-v1] No entity data found. Make sure files have been processed by the intel pass."
+
+    lines = ["[entity-intel-v1] Entity summary for your company:", ""]
+    for etype in types_to_count:
+        info = raw.get(etype, {"count": 0, "examples": []})
+        if info["count"] == 0:
+            continue
+        examples = info["examples"][:5]
+        sample = ", ".join(str(e) for e in examples)
+        more = f" (+{info['count'] - len(examples)} more)" if info["count"] > len(examples) else ""
+        lines.append(f"**{label_map[etype]}**: {info['count']} unique — e.g. {sample}{more}")
+    lines.append("\nAsk about any entity: 'show everything about T-04' or 'which files mention Carlos Mendez'")
+    return "\n".join(lines)
+
+
+async def run_entity_lookup(company_id: uuid.UUID, search_term: str) -> str:
+    cid_str = str(company_id)
+    search_lower = search_term.lower().strip()
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select em.entity_type, em.canonical_value, em.value, em.source_field,
+                       em.source_row, em.confidence_score, fv.original_filename, em.file_version_id
+                from entity_mentions em
+                join file_versions fv on fv.id = em.file_version_id
+                where em.company_id = $1
+                  and (lower(em.canonical_value) ilike $2 or lower(em.value) ilike $2)
+                order by em.entity_type, em.canonical_value
+                limit 200
+                """,
+                company_id, f"%{search_lower}%",
+            )
+            mentions = [dict(r) for r in rows]
+
+            # Risk flags from file_intelligence
+            risk_rows = await c.fetch(
+                """
+                select fi.risk_flags, fv.original_filename
+                from file_intelligence fi
+                join file_versions fv on fv.id = fi.file_version_id
+                where fi.company_id = $1
+                  and fi.short_summary ilike $2
+                limit 10
+                """,
+                company_id, f"%{search_lower}%",
+            )
+            risk_data = [dict(r) for r in risk_rows]
+    else:
+        sb = _sb()
+        mentions = (
+            sb.table("entity_mentions")
+            .select("entity_type,canonical_value,value,source_field,source_row,confidence_score,file_version_id")
+            .eq("company_id", cid_str)
+            .ilike("canonical_value", f"%{search_lower}%")
+            .limit(200)
+            .execute()
+            .data or []
+        )
+        # Enrich with filenames
+        fv_ids = list({str(m.get("file_version_id")) for m in mentions if m.get("file_version_id")})
+        fname_map: dict = {}
+        if fv_ids:
+            fv_rows = (
+                sb.table("file_versions")
+                .select("id,original_filename")
+                .in_("id", fv_ids)
+                .execute()
+                .data or []
+            )
+            fname_map = {r["id"]: r["original_filename"] for r in fv_rows}
+        for m in mentions:
+            m["original_filename"] = fname_map.get(str(m.get("file_version_id")), "unknown")
+        risk_data = []
+
+    if not mentions:
+        return (
+            f"[entity-intel-v1] No entity records found for \"{search_term}\". "
+            "Try exact match or use 'search for' to do a full text search."
+        )
+
+    # Group by entity_type
+    by_type: dict[str, list] = {}
+    by_file: dict[str, int] = {}
+    for m in mentions:
+        etype = m.get("entity_type") or "unknown"
+        by_type.setdefault(etype, []).append(m)
+        fname = m.get("original_filename") or "unknown"
+        by_file[fname] = by_file.get(fname, 0) + 1
+
+    canonical_values = sorted({m.get("canonical_value") for m in mentions if m.get("canonical_value")})
+    lines = [
+        f"[entity-intel-v1] Entity lookup: **{search_term}**",
+        f"Found {len(mentions)} mention{'s' if len(mentions) != 1 else ''} across {len(by_file)} file{'s' if len(by_file) != 1 else ''}.",
+        "",
+    ]
+
+    lines.append("**Entity types:**")
+    for etype, items in sorted(by_type.items()):
+        canonical = sorted({i.get("canonical_value") for i in items if i.get("canonical_value")})
+        lines.append(f"- {etype}: {', '.join(canonical[:5])}" + (f" (+{len(canonical)-5} more)" if len(canonical) > 5 else ""))
+
+    lines.append("")
+    lines.append("**Files containing this entity:**")
+    for fname, count in sorted(by_file.items(), key=lambda x: -x[1])[:10]:
+        lines.append(f"- {fname} ({count} mention{'s' if count != 1 else ''})")
+
+    # Source previews
+    preview_items = mentions[:3]
+    if preview_items:
+        lines.append("")
+        lines.append("**Sample source context:**")
+        for m in preview_items:
+            field = m.get("source_field") or ""
+            row = m.get("source_row") or ""
+            loc = f" (field: {field}, row: {row})" if field or row else ""
+            lines.append(f"- {m.get('original_filename')}: \"{m.get('value')}\"{loc}")
+
+    # Risk flags
+    if risk_data:
+        all_flags: list[str] = []
+        for rd in risk_data:
+            flags = rd.get("risk_flags") or []
+            if isinstance(flags, list):
+                for f in flags:
+                    if isinstance(f, str):
+                        all_flags.append(f)
+                    elif isinstance(f, dict):
+                        all_flags.append(f.get("flag") or f.get("type") or str(f))
+        if all_flags:
+            lines.append("")
+            lines.append(f"**Related risk flags:** {', '.join(sorted(set(all_flags))[:5])}")
+
+    lines.append("")
+    lines.append(f"Follow-up ideas: 'which files mention {search_term}?' or 'show total revenue for {search_term}'")
+    return "\n".join(lines)
+
+
+async def run_entity_files(company_id: uuid.UUID, search_term: str) -> str:
+    """Return files mentioning an entity, preferring entity_mentions over full-text search."""
+    cid_str = str(company_id)
+    search_lower = search_term.lower().strip()
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select fv.original_filename, count(*) as mention_count,
+                       array_agg(distinct em.entity_type) as entity_types
+                from entity_mentions em
+                join file_versions fv on fv.id = em.file_version_id
+                where em.company_id = $1
+                  and (lower(em.canonical_value) ilike $2 or lower(em.value) ilike $2)
+                group by fv.original_filename
+                order by mention_count desc
+                limit 50
+                """,
+                company_id, f"%{search_lower}%",
+            )
+            entity_results = [dict(r) for r in rows]
+    else:
+        sb = _sb()
+        mentions = (
+            sb.table("entity_mentions")
+            .select("canonical_value,value,entity_type,file_version_id")
+            .eq("company_id", cid_str)
+            .ilike("canonical_value", f"%{search_lower}%")
+            .limit(500)
+            .execute()
+            .data or []
+        )
+        fv_ids = list({str(m.get("file_version_id")) for m in mentions if m.get("file_version_id")})
+        fname_map: dict = {}
+        if fv_ids:
+            fv_rows = (
+                sb.table("file_versions").select("id,original_filename")
+                .in_("id", fv_ids).execute().data or []
+            )
+            fname_map = {r["id"]: r["original_filename"] for r in fv_rows}
+        agg: dict = {}
+        for m in mentions:
+            fname = fname_map.get(str(m.get("file_version_id")), "unknown")
+            if fname not in agg:
+                agg[fname] = {"mention_count": 0, "entity_types": set()}
+            agg[fname]["mention_count"] += 1
+            agg[fname]["entity_types"].add(m.get("entity_type") or "unknown")
+        entity_results = [
+            {"original_filename": fn, "mention_count": v["mention_count"],
+             "entity_types": list(v["entity_types"])}
+            for fn, v in sorted(agg.items(), key=lambda x: -x[1]["mention_count"])
+        ]
+
+    if not entity_results:
+        # Fallback to full-text chunk search
+        chunk_rows = await _load_chunks_matching_term(str(company_id), search_term, limit=200)
+        if chunk_rows:
+            return _build_files_mentioning_answer(search_term, chunk_rows)
+        return f"[entity-intel-v1] No files found mentioning \"{search_term}\" in entity records or document text."
+
+    lines = [
+        f"[entity-intel-v1] Files mentioning **{search_term}** (from entity index):",
+        "",
+    ]
+    for i, r in enumerate(entity_results[:20], 1):
+        etypes = ", ".join(r.get("entity_types") or [])
+        lines.append(
+            f"{i}. {r['original_filename']} — "
+            f"{r['mention_count']} mention{'s' if r['mention_count'] != 1 else ''}"
+            + (f" [{etypes}]" if etypes else "")
+        )
+    return "\n".join(lines)
+
+
+async def _dispatch_entity_intent(q: str, company_id: uuid.UUID) -> str | None:
+    """Returns an answer string if the question is an entity intent, else None."""
+    # Order matters: files intent before lookup to avoid mis-routing
+    if detect_entity_summary_intent(q):
+        return await run_entity_summary(company_id)
+
+    files_intent = detect_entity_files_intent(q)
+    if files_intent:
+        _, term = files_intent
+        return await run_entity_files(company_id, term)
+
+    lookup_intent = detect_entity_lookup_intent(q)
+    if lookup_intent:
+        _, term = lookup_intent
+        return await run_entity_lookup(company_id, term)
+
+    return None
+
+
+# ── Risk/intel-aware intent detection (Task 2) ────────────────────────────────
+
+NEEDS_REVIEW_PATTERNS = (
+    "which files need review", "what files need review", "show needs review",
+    "files that need review", "what should i review", "needs review files",
+    "needs review", "need review", "flagged for review",
+)
+
+RISK_SUMMARY_PATTERNS = (
+    "what risks do we have", "what issues do we have", "show risk flags",
+    "show risks", "show issues", "what risk flags", "any risks",
+    "safety issues", "missing po", "missing po issues", "expired cert",
+    "expired certification", "spill incident", "what are our risks",
+    "any issues", "open issues", "risk summary",
+)
+
+INTEL_CATEGORY_PATTERNS = (
+    "which files are safety", "safety related files", "show financial files",
+    "financial files", "what field data files", "field data files",
+    "compliance docs", "compliance documents", "what communications files",
+    "communications files", "files by category", "show category",
+    "files are safety related", "show safety files", "show compliance",
+    "what category", "which category",
+)
+
+FILE_INTEL_LOOKUP_PATTERNS = (
+    "summarize what patchbrain knows about", "what kind of file is",
+    "what are the key entities in", "what does patchbrain know about",
+    "tell me about the file", "intelligence for", "file summary for",
+    "what is in the file",
+)
+
+
+def detect_needs_review_intent(q: str) -> bool:
+    ql = _normalize_question(q)
+    return any(p in ql for p in NEEDS_REVIEW_PATTERNS)
+
+
+def detect_risk_summary_intent(q: str) -> str | None:
+    """Returns a specific risk flag keyword if a risk-lookup is detected, else 'all' for general summary."""
+    ql = _normalize_question(q)
+    if not any(p in ql for p in RISK_SUMMARY_PATTERNS):
+        return None
+    # Specific risk type requested?
+    if any(w in ql for w in ("missing po", "missing purchase order")):
+        return "missing_po"
+    if any(w in ql for w in ("expired cert", "expired certification", "certification")):
+        return "expired_cert"
+    if any(w in ql for w in ("spill", "spill incident", "environmental")):
+        return "spill_incident"
+    if any(w in ql for w in ("safety",)):
+        return "safety"
+    return "all"
+
+
+def detect_intel_category_intent(q: str) -> str | None:
+    ql = _normalize_question(q)
+    if not any(p in ql for p in INTEL_CATEGORY_PATTERNS):
+        return None
+    # Return the category keyword
+    for cat in ("safety", "financial", "field_data", "compliance", "communications",
+                "operational", "environmental", "legal", "hr"):
+        if cat.replace("_", " ") in ql or cat in ql:
+            return cat
+    return "all"
+
+
+def detect_file_intel_lookup_intent(q: str) -> str | None:
+    """Returns the filename/search term if a file-intel lookup is detected."""
+    ql = _normalize_question(q)
+    for p in FILE_INTEL_LOOKUP_PATTERNS:
+        if p in ql:
+            idx = q.lower().find(p)
+            after = q[idx + len(p):].strip(" ?.,:")
+            if after:
+                return after
+    return None
+
+
+def _extract_risk_flags(flags_raw) -> list[str]:
+    """Normalize risk_flags from JSONB — handles list[str] and list[dict]."""
+    if not flags_raw:
+        return []
+    if isinstance(flags_raw, str):
+        try:
+            flags_raw = json.loads(flags_raw)
+        except Exception:
+            return [flags_raw]
+    if not isinstance(flags_raw, list):
+        return []
+    out = []
+    for f in flags_raw:
+        if isinstance(f, str):
+            out.append(f)
+        elif isinstance(f, dict):
+            out.append(f.get("flag") or f.get("type") or f.get("name") or str(f))
+    return [x for x in out if x]
+
+
+async def run_needs_review(company_id: uuid.UUID) -> str:
+    cid_str = str(company_id)
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select fi.short_summary, fi.category, fi.document_type, fi.risk_flags,
+                       fv.original_filename
+                from file_intelligence fi
+                join file_versions fv on fv.id = fi.file_version_id
+                join files f on f.id = fi.file_id
+                where fi.company_id = $1
+                  and fi.needs_review = true
+                  and f.deleted_at is null
+                order by fi.created_at desc
+                limit 50
+                """,
+                company_id,
+            )
+            data = [dict(r) for r in rows]
+    else:
+        sb = _sb()
+        rows = (
+            sb.table("file_intelligence")
+            .select("short_summary,category,document_type,risk_flags,file_version_id")
+            .eq("company_id", cid_str)
+            .eq("needs_review", True)
+            .order("created_at", desc=True)
+            .limit(50)
+            .execute()
+            .data or []
+        )
+        fv_ids = [str(r.get("file_version_id")) for r in rows if r.get("file_version_id")]
+        fname_map: dict = {}
+        if fv_ids:
+            fv_rows = (
+                sb.table("file_versions").select("id,original_filename")
+                .in_("id", fv_ids).execute().data or []
+            )
+            fname_map = {r["id"]: r["original_filename"] for r in fv_rows}
+        data = []
+        for r in rows:
+            r["original_filename"] = fname_map.get(str(r.get("file_version_id")), "unknown")
+            data.append(r)
+
+    if not data:
+        return "[intel-v1] No files are currently flagged for review."
+
+    lines = [f"[intel-v1] **{len(data)} file{'s' if len(data) != 1 else ''} need review:**", ""]
+    for i, r in enumerate(data[:25], 1):
+        fname = r.get("original_filename") or "unknown"
+        cat = r.get("category") or ""
+        doc_type = r.get("document_type") or ""
+        summary = (r.get("short_summary") or "")[:120]
+        flags = _extract_risk_flags(r.get("risk_flags"))
+        flag_str = f" — ⚠ {', '.join(flags[:3])}" if flags else ""
+        meta = " · ".join(x for x in [cat, doc_type] if x)
+        lines.append(f"{i}. **{fname}**" + (f" [{meta}]" if meta else "") + flag_str)
+        if summary:
+            lines.append(f"   {summary}")
+    return "\n".join(lines)
+
+
+async def run_risk_summary(company_id: uuid.UUID, risk_filter: str) -> str:
+    cid_str = str(company_id)
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select fi.risk_flags, fv.original_filename
+                from file_intelligence fi
+                join file_versions fv on fv.id = fi.file_version_id
+                join files f on f.id = fi.file_id
+                where fi.company_id = $1
+                  and fi.risk_flags is not null
+                  and jsonb_array_length(fi.risk_flags) > 0
+                  and f.deleted_at is null
+                limit 200
+                """,
+                company_id,
+            )
+            data = [dict(r) for r in rows]
+    else:
+        sb = _sb()
+        rows = (
+            sb.table("file_intelligence")
+            .select("risk_flags,file_version_id")
+            .eq("company_id", cid_str)
+            .not_.is_("risk_flags", "null")
+            .order("created_at", desc=True)
+            .limit(200)
+            .execute()
+            .data or []
+        )
+        fv_ids = [str(r.get("file_version_id")) for r in rows if r.get("file_version_id")]
+        fname_map: dict = {}
+        if fv_ids:
+            fv_rows = (
+                sb.table("file_versions").select("id,original_filename")
+                .in_("id", fv_ids).execute().data or []
+            )
+            fname_map = {r["id"]: r["original_filename"] for r in fv_rows}
+        data = []
+        for r in rows:
+            r["original_filename"] = fname_map.get(str(r.get("file_version_id")), "unknown")
+            data.append(r)
+
+    if not data:
+        return "[intel-v1] No risk flags found in your files."
+
+    # Aggregate: flag -> list of filenames
+    flag_files: dict[str, list[str]] = {}
+    for r in data:
+        flags = _extract_risk_flags(r.get("risk_flags"))
+        fname = r.get("original_filename") or "unknown"
+        for flag in flags:
+            flag_files.setdefault(flag, []).append(fname)
+
+    if not flag_files:
+        return "[intel-v1] Files have risk_flags set but no parseable flag values were found."
+
+    # Filter if specific risk type requested
+    if risk_filter != "all":
+        flag_files = {k: v for k, v in flag_files.items() if risk_filter.lower() in k.lower()}
+        if not flag_files:
+            return f"[intel-v1] No \"{risk_filter}\" risk flags found in your files."
+
+    lines = [f"[intel-v1] **Risk flag summary** ({len(flag_files)} distinct flag type{'s' if len(flag_files) != 1 else ''}):", ""]
+    for flag, files in sorted(flag_files.items(), key=lambda x: -len(x[1])):
+        unique_files = sorted(set(files))
+        examples = ", ".join(unique_files[:3]) + ("…" if len(unique_files) > 3 else "")
+        lines.append(f"- **{flag}**: {len(unique_files)} file{'s' if len(unique_files) != 1 else ''} — {examples}")
+    lines.append("\nAsk: 'which files need review?' or 'explain the missing PO issue in <filename>'")
+    return "\n".join(lines)
+
+
+async def run_intel_category_files(company_id: uuid.UUID, category: str) -> str:
+    cid_str = str(company_id)
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            if category == "all":
+                rows = await c.fetch(
+                    """
+                    select fi.category, fi.document_type, fi.short_summary,
+                           fi.risk_flags, fv.original_filename
+                    from file_intelligence fi
+                    join file_versions fv on fv.id = fi.file_version_id
+                    join files f on f.id = fi.file_id
+                    where fi.company_id = $1 and f.deleted_at is null
+                    order by fi.category, fi.created_at desc
+                    limit 100
+                    """,
+                    company_id,
+                )
+            else:
+                rows = await c.fetch(
+                    """
+                    select fi.category, fi.document_type, fi.short_summary,
+                           fi.risk_flags, fv.original_filename
+                    from file_intelligence fi
+                    join file_versions fv on fv.id = fi.file_version_id
+                    join files f on f.id = fi.file_id
+                    where fi.company_id = $1
+                      and (lower(fi.category) ilike $2 or lower(fi.document_type) ilike $2)
+                      and f.deleted_at is null
+                    order by fi.created_at desc
+                    limit 50
+                    """,
+                    company_id, f"%{category.replace('_', ' ')}%",
+                )
+            data = [dict(r) for r in rows]
+    else:
+        sb = _sb()
+        q_builder = (
+            sb.table("file_intelligence")
+            .select("category,document_type,short_summary,risk_flags,file_version_id")
+            .eq("company_id", cid_str)
+        )
+        if category != "all":
+            q_builder = q_builder.ilike("category", f"%{category.replace('_', ' ')}%")
+        rows = q_builder.order("created_at", desc=True).limit(100).execute().data or []
+        fv_ids = [str(r.get("file_version_id")) for r in rows if r.get("file_version_id")]
+        fname_map: dict = {}
+        if fv_ids:
+            fv_rows = (
+                sb.table("file_versions").select("id,original_filename")
+                .in_("id", fv_ids).execute().data or []
+            )
+            fname_map = {r["id"]: r["original_filename"] for r in fv_rows}
+        data = []
+        for r in rows:
+            r["original_filename"] = fname_map.get(str(r.get("file_version_id")), "unknown")
+            data.append(r)
+
+    if not data:
+        label = category.replace("_", " ") if category != "all" else ""
+        return f"[intel-v1] No {'`' + label + '`' if label else ''} files found in the intel index."
+
+    label = category.replace("_", " ").title() if category != "all" else "All categories"
+    lines = [f"[intel-v1] **{label} files** ({len(data)} found):", ""]
+    for i, r in enumerate(data[:25], 1):
+        fname = r.get("original_filename") or "unknown"
+        cat = r.get("category") or ""
+        doc_type = r.get("document_type") or ""
+        summary = (r.get("short_summary") or "")[:100]
+        flags = _extract_risk_flags(r.get("risk_flags"))
+        flag_str = f" ⚠ {', '.join(flags[:2])}" if flags else ""
+        meta = " · ".join(x for x in [cat, doc_type] if x)
+        lines.append(f"{i}. **{fname}**" + (f" [{meta}]" if meta else "") + flag_str)
+        if summary:
+            lines.append(f"   {summary}")
+    return "\n".join(lines)
+
+
+async def run_file_intel_lookup(company_id: uuid.UUID, search_term: str) -> str:
+    cid_str = str(company_id)
+    search_lower = search_term.lower().strip()
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select fi.*, fv.original_filename
+                from file_intelligence fi
+                join file_versions fv on fv.id = fi.file_version_id
+                join files f on f.id = fi.file_id
+                where fi.company_id = $1
+                  and (lower(fv.original_filename) ilike $2 or lower(fi.short_summary) ilike $2)
+                  and f.deleted_at is null
+                order by fi.created_at desc
+                limit 5
+                """,
+                company_id, f"%{search_lower}%",
+            )
+            data = [dict(r) for r in rows]
+    else:
+        sb = _sb()
+        rows = (
+            sb.table("file_intelligence")
+            .select("*,file_versions(original_filename)")
+            .eq("company_id", cid_str)
+            .ilike("short_summary", f"%{search_lower}%")
+            .order("created_at", desc=True)
+            .limit(5)
+            .execute()
+            .data or []
+        )
+        data = []
+        for r in rows:
+            fv = r.pop("file_versions", None) or {}
+            r["original_filename"] = fv.get("original_filename") or "unknown"
+            data.append(r)
+
+    if not data:
+        return f"[intel-v1] No intel record found for \"{search_term}\". The file may not have been processed yet."
+
+    lines = []
+    for r in data[:3]:
+        fname = r.get("original_filename") or "unknown"
+        lines.append(f"[intel-v1] **File intel: {fname}**")
+        lines.append("")
+        if r.get("category"):
+            lines.append(f"- **Category:** {r['category']}")
+        if r.get("document_type"):
+            lines.append(f"- **Document type:** {r['document_type']}")
+        if r.get("short_summary"):
+            lines.append(f"- **Summary:** {r['short_summary']}")
+        if r.get("needs_review"):
+            lines.append("- ⚠ **Flagged for review**")
+        flags = _extract_risk_flags(r.get("risk_flags"))
+        if flags:
+            lines.append(f"- **Risk flags:** {', '.join(flags)}")
+        key_entities = r.get("key_entities")
+        if key_entities:
+            if isinstance(key_entities, list):
+                lines.append(f"- **Key entities:** {', '.join(str(e) for e in key_entities[:10])}")
+            elif isinstance(key_entities, str):
+                lines.append(f"- **Key entities:** {key_entities[:200]}")
+        suggested = r.get("suggested_questions")
+        if suggested:
+            if isinstance(suggested, list):
+                lines.append("- **Suggested questions:**")
+                for sq in suggested[:3]:
+                    lines.append(f"  - {sq}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+async def _dispatch_intel_intent(q: str, company_id: uuid.UUID) -> tuple[str, str] | None:
+    """Returns (answer, intent_type) if question is an intel/risk intent, else None."""
+    ql = _normalize_question(q)
+
+    if detect_needs_review_intent(q):
+        return (await run_needs_review(company_id), "needs_review_files")
+
+    risk_filter = detect_risk_summary_intent(q)
+    if risk_filter is not None:
+        intent = "risk_lookup" if risk_filter != "all" else "risk_summary"
+        return (await run_risk_summary(company_id, risk_filter), intent)
+
+    cat = detect_intel_category_intent(q)
+    if cat is not None:
+        return (await run_intel_category_files(company_id, cat), "intel_category_files")
+
+    file_term = detect_file_intel_lookup_intent(q)
+    if file_term:
+        return (await run_file_intel_lookup(company_id, file_term), "file_intel_lookup")
+
+    return None
+
+
 def _clean_extracted_term(term: str) -> str:
     """Strip surrounding quotes, trailing punctuation, and noise words from extracted search terms."""
     if not term:
@@ -1508,6 +2271,38 @@ async def ask(b: AskBody, u=Depends(get_user)):
             ),
             media_type="text/event-stream",
             headers={"X-Accel-Buffering":"no","Cache-Control":"no-cache"},
+        )
+
+    # Entity-aware intents: answer from entity_mentions, not RAG.
+    entity_answer = await _dispatch_entity_intent(q, cid)
+    if entity_answer is not None:
+        # Determine which sub-intent for logging
+        if detect_entity_summary_intent(q):
+            entity_intent_type = "entity_summary"
+        elif detect_entity_files_intent(q):
+            entity_intent_type = "entity_files"
+        else:
+            entity_intent_type = "entity_lookup"
+        return StreamingResponse(
+            _stream_direct_answer(
+                sid, cid, uid, q, entity_answer, new_count, history, srow, started_at,
+                intent_type=entity_intent_type,
+            ),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+        )
+
+    # Risk/intel-aware intents: answer from file_intelligence, not RAG.
+    intel_result = await _dispatch_intel_intent(q, cid)
+    if intel_result is not None:
+        intel_answer, intel_intent_type = intel_result
+        return StreamingResponse(
+            _stream_direct_answer(
+                sid, cid, uid, q, intel_answer, new_count, history, srow, started_at,
+                intent_type=intel_intent_type,
+            ),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
         )
 
     # Deterministic tools: exact counts/searches should use SQL/Python, not Claude.

@@ -505,7 +505,20 @@ export default function IssuesPage() {
 
                     {/* Ask in chat button */}
                     <button
-                      onClick={() => router.push(`/chat?q=${encodeURIComponent(`Summarize the issues in ${displayName(r)}`)}`)}
+                      onClick={() => {
+                        const name = displayName(r)
+                        const flag = flags[0]
+                        const prompts: Record<string, string> = {
+                          expired_cert:    `Explain the expired certification issue in ${name} and what should be checked next.`,
+                          missing_po:      `Explain the missing PO issue in ${name} and what source files mention it.`,
+                          spill_incident:  `Explain the spill incident in ${name} and what follow-up is needed.`,
+                          unknown_category:`Review why ${name} needs classification review.`,
+                          failed_parser:   `Why did ${name} fail processing and what should I do next?`,
+                          needs_review:    `What issues were flagged in ${name} and what should I review?`,
+                        }
+                        const prompt = prompts[flag] || `Summarize the issues flagged in ${name} and what action is needed.`
+                        router.push(`/chat?prompt=${encodeURIComponent(prompt)}`)
+                      }}
                       style={{
                         alignSelf: 'flex-start', padding: '5px 12px', borderRadius: 7, fontSize: 12,
                         background: 'rgba(249,115,22,0.07)', color: '#fdba74',
@@ -515,7 +528,7 @@ export default function IssuesPage() {
                       onMouseEnter={e => { e.currentTarget.style.background = 'rgba(249,115,22,0.13)' }}
                       onMouseLeave={e => { e.currentTarget.style.background = 'rgba(249,115,22,0.07)' }}
                     >
-                      Ask PatchBrain about this file →
+                      Ask about this issue →
                     </button>
                   </div>
                 )

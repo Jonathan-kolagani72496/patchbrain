@@ -18,15 +18,15 @@
  * - Empty state: example prompts pre-populated per domain
  */
 
-import {
+import React, {
+  Suspense,
   useCallback,
   useEffect,
   useLayoutEffect,
   useRef,
   useState,
-  useTransition,
 } from 'react'
-import { useRouter } from 'next/navigation'
+import { useRouter, useSearchParams } from 'next/navigation'
 import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import { API_URL, getAuthHeader, supabase } from '@/lib/supabase'
@@ -608,8 +608,9 @@ const EXAMPLE_PROMPTS = [
   'What invoices are still unpaid?',
 ]
 
-export default function ChatPage() {
+function ChatPageInner() {
   const router = useRouter()
+  const searchParams = useSearchParams()
 
   /* ── Refs ── */
   const inputRef = useRef<HTMLTextAreaElement>(null)
@@ -637,7 +638,6 @@ export default function ChatPage() {
   const [followUps, setFollowUps] = useState<string[]>([])
   const [copiedId, setCopiedId] = useState<string | null>(null)
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false)
-  const [, startTransition] = useTransition()
 
   /* ── Textarea auto-height ── */
   useLayoutEffect(() => {
@@ -675,6 +675,25 @@ export default function ChatPage() {
     loadSessions()
     fetchMe()
     return () => { alive = false }
+  }, [])
+
+  /* ── Prompt prefill from ?prompt= query param (issue drilldown) ── */
+  useEffect(() => {
+    const prompt = searchParams.get('prompt')
+    if (!prompt) return
+    const decoded = decodeURIComponent(prompt).trim()
+    if (!decoded) return
+    // Small delay so refs and state are ready after mount
+    const t = setTimeout(() => {
+      setInput(decoded)
+      inputRef.current?.focus()
+      // Remove ?prompt from URL so a page refresh doesn't re-prefill
+      const url = new URL(window.location.href)
+      url.searchParams.delete('prompt')
+      window.history.replaceState({}, '', url.toString())
+    }, 120)
+    return () => clearTimeout(t)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
   /* ── Scroll to bottom on new messages (only if already at bottom) ── */
@@ -1742,5 +1761,13 @@ export default function ChatPage() {
         </section>
       </main>
     </>
+  )
+}
+
+export default function ChatPage() {
+  return (
+    <Suspense fallback={<div className="p-6 text-sm text-gray-500">Loading chat...</div>}>
+      <ChatPageInner />
+    </Suspense>
   )
 }
