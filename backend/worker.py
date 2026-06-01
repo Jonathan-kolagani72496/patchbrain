@@ -31,6 +31,9 @@ from parsers.csv_parser import parse_csv
 from parsers.docx_parser import parse_docx
 from parsers.whatsapp_parser import parse_whatsapp
 
+# Intelligence pass — runs after chunks are inserted, non-fatal
+from intelligence import run_intelligence_pass
+
 load_dotenv()
 
 WORKER_ID = f"worker-{uuid.uuid4().hex[:8]}"
@@ -449,6 +452,20 @@ def process_job(sb: Client, job: dict):
         .execute()
 
     update_file_status(sb, version_id, "ready")
+
+    # ── Intelligence pass (non-fatal) ─────────────────────────────────────────
+    # Runs after chunks are committed and version is 'ready'.
+    # Failures here do NOT roll back the job or change the file status.
+    run_intelligence_pass(
+        sb=sb,
+        version_id=version_id,
+        file_id=file_id,
+        company_id=company_id,
+        chunks=chunks,
+        original_filename=original_filename,
+        version_status="ready",
+    )
+    # ─────────────────────────────────────────────────────────────────────────
 
     sb.table("processing_jobs")\
         .update({"status": "done", "updated_at": "now()"})\

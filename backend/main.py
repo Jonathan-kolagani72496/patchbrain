@@ -1852,6 +1852,286 @@ async def get_chunk_evidence(chunk_id: str, u=Depends(get_user)):
     }
 
 
+# ── File intelligence endpoints ───────────────────────────────────────────────
+
+@app.get("/files/intelligence")
+async def list_file_intelligence(
+    category:      Optional[str] = None,
+    document_type: Optional[str] = None,
+    needs_review:  Optional[bool] = None,
+    search:        Optional[str] = None,
+    u=Depends(get_user),
+):
+    """
+    Returns file_intelligence rows for the authenticated user's company.
+    Optional filters: category, document_type, needs_review, search (scans short_summary).
+    """
+    cid = uuid.UUID(str(u["company_id"]))
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            # Build dynamic WHERE clauses
+            conditions = ["fi.company_id = $1", "f.deleted_at is null"]
+            params: list = [cid]
+            idx = 2
+
+            if category:
+                conditions.append(f"fi.category = ${idx}")
+                params.append(category)
+                idx += 1
+            if document_type:
+                conditions.append(f"fi.document_type = ${idx}")
+                params.append(document_type)
+                idx += 1
+            if needs_review is not None:
+                conditions.append(f"fi.needs_review = ${idx}")
+                params.append(needs_review)
+                idx += 1
+            if search:
+                conditions.append(f"fi.short_summary ilike ${idx}")
+                params.append(f"%{search}%")
+                idx += 1
+
+            where = " AND ".join(conditions)
+            rows = await c.fetch(
+                f"""
+                select
+                    fi.*,
+                    f.logical_name,
+                    fv.original_filename,
+                    fv.status as version_status,
+                    fv.created_at as version_created_at
+                from file_intelligence fi
+                join file_versions fv on fv.id = fi.file_version_id
+                join files f on f.id = fi.file_id
+                where {where}
+                order by fi.created_at desc
+                limit 200
+                """,
+                *params,
+            )
+            return [dict(r) for r in rows]
+
+    # Supabase fallback
+    sb = _sb()
+    cid_str = str(cid)
+    q = sb.table("file_intelligence").select(
+        "*, file_versions(original_filename, status, created_at), files(logical_name, deleted_at)"
+    ).eq("company_id", cid_str)
+
+    if category:
+        q = q.eq("category", category)
+    if document_type:
+        q = q.eq("document_type", document_type)
+    if needs_review is not None:
+        q = q.eq("needs_review", needs_review)
+    if search:
+        q = q.ilike("short_summary", f"%{search}%")
+
+    rows = q.order("created_at", desc=True).limit(200).execute().data or []
+    # Filter out deleted files
+    return [r for r in rows if not (r.get("files") or {}).get("deleted_at")]
+
+
+@app.get("/files/{file_id}/intelligence")
+async def get_file_intelligence(file_id: str, u=Depends(get_user)):
+    """
+    Returns file_intelligence row + top entity_mentions for a single file.
+    Company-scoped.
+    """
+    cid = uuid.UUID(str(u["company_id"]))
+    try:
+        fid = uuid.UUID(file_id)
+    except ValueError:
+        raise HTTPException(400, "Invalid file_id")
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            intel = await c.fetchrow(
+                """
+                select fi.*, fv.original_filename, fv.status as version_status
+                from file_intelligence fi
+                join file_versions fv on fv.id = fi.file_version_id
+                join files f on f.id = fi.file_id
+                where fi.file_id = $1
+                  and fi.company_id = $2
+                  and f.deleted_at is null
+                order by fi.created_at desc
+                limit 1
+                """,
+                fid, cid,
+            )
+            if not intel:
+                raise HTTPException(404, "No intelligence record found for this file")
+
+            entities = await c.fetch(
+                """
+                select entity_type, value, canonical_value, source_field,
+                       source_row, confidence_score, extraction_method
+                from entity_mentions
+                where file_id = $1
+                  and company_id = $2
+                order by entity_type, canonical_value
+                limit 500
+                """,
+                fid, cid,
+            )
+            return {
+                "intelligence": dict(intel),
+                "entities": [dict(e) for e in entities],
+            }
+
+    sb = _sb()
+    cid_str = str(cid)
+    intel_rows = (
+        sb.table("file_intelligence")
+        .select("*")
+        .eq("file_id", file_id)
+        .eq("company_id", cid_str)
+        .order("created_at", desc=True)
+        .limit(1)
+        .execute()
+        .data or []
+    )
+    if not intel_rows:
+        raise HTTPException(404, "No intelligence record found for this file")
+
+    entities = (
+        sb.table("entity_mentions")
+        .select("entity_type,value,canonical_value,source_field,source_row,confidence_score,extraction_method")
+        .eq("file_id", file_id)
+        .eq("company_id", cid_str)
+        .order("entity_type")
+        .limit(500)
+        .execute()
+        .data or []
+    )
+    return {"intelligence": intel_rows[0], "entities": entities}
+
+
+@app.get("/entities")
+async def list_entities(
+    entity_type: Optional[str] = None,
+    search:      Optional[str] = None,
+    limit:       int = 50,
+    u=Depends(get_user),
+):
+    """
+    Query entity_mentions for the authenticated user's company.
+    Optional: entity_type filter, value/canonical_value search.
+    """
+    cid = uuid.UUID(str(u["company_id"]))
+    limit = max(1, min(limit, 500))
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            conditions = ["em.company_id = $1"]
+            params: list = [cid]
+            idx = 2
+
+            if entity_type:
+                conditions.append(f"em.entity_type = ${idx}")
+                params.append(entity_type)
+                idx += 1
+            if search:
+                conditions.append(f"em.canonical_value ilike ${idx}")
+                params.append(f"%{search.lower()}%")
+                idx += 1
+
+            # limit is a separate clause, not part of WHERE
+            params.append(limit)
+            limit_ph = f"${idx}"
+            where = " AND ".join(conditions)
+            rows = await c.fetch(
+                f"""
+                select
+                    em.entity_type,
+                    em.canonical_value,
+                    em.value,
+                    em.source_field,
+                    em.source_row,
+                    em.confidence_score,
+                    em.extraction_method,
+                    fv.original_filename,
+                    em.file_version_id
+                from entity_mentions em
+                join file_versions fv on fv.id = em.file_version_id
+                where {where}
+                order by em.entity_type, em.canonical_value
+                limit {limit_ph}
+                """,
+                *params,
+            )
+            return [dict(r) for r in rows]
+
+    sb = _sb()
+    cid_str = str(cid)
+    q = (
+        sb.table("entity_mentions")
+        .select("entity_type,canonical_value,value,source_field,source_row,confidence_score,extraction_method,file_version_id")
+        .eq("company_id", cid_str)
+    )
+    if entity_type:
+        q = q.eq("entity_type", entity_type)
+    if search:
+        q = q.ilike("canonical_value", f"%{search.lower()}%")
+
+    rows = q.order("entity_type").order("canonical_value").limit(limit).execute().data or []
+    return rows
+
+
+@app.get("/entities/summary")
+async def entities_summary(u=Depends(get_user)):
+    """
+    Returns grouped counts of unique canonical values per key entity type.
+    E.g. {"trucks": 7, "drivers": 3, "clients": 4, "leases": 12, ...}
+    """
+    cid = uuid.UUID(str(u["company_id"]))
+    types_to_count = ["truck", "driver", "client", "lease", "ticket_id", "invoice_id", "po_number", "job_id"]
+
+    if DB_POOL:
+        async with DB_POOL.acquire() as c:
+            rows = await c.fetch(
+                """
+                select entity_type, count(distinct canonical_value) as distinct_count
+                from entity_mentions
+                where company_id = $1
+                  and entity_type = any($2::text[])
+                group by entity_type
+                """,
+                cid, types_to_count,
+            )
+            raw = {r["entity_type"]: r["distinct_count"] for r in rows}
+    else:
+        sb = _sb()
+        cid_str = str(cid)
+        raw: dict = {}
+        for etype in types_to_count:
+            try:
+                res = (
+                    sb.table("entity_mentions")
+                    .select("canonical_value")
+                    .eq("company_id", cid_str)
+                    .eq("entity_type", etype)
+                    .execute()
+                )
+                raw[etype] = len({r["canonical_value"] for r in (res.data or [])})
+            except Exception:
+                raw[etype] = 0
+
+    label_map = {
+        "truck":      "trucks",
+        "driver":     "drivers",
+        "client":     "clients",
+        "lease":      "leases",
+        "ticket_id":  "ticket_ids",
+        "invoice_id": "invoice_ids",
+        "po_number":  "po_numbers",
+        "job_id":     "job_ids",
+    }
+    return {label_map[k]: int(raw.get(k, 0)) for k in types_to_count}
+
+
 @app.get("/health")
 async def health():
     return {"status":"ok","version":"3.0.0","pool": DB_POOL is not None}
